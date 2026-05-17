@@ -1,27 +1,28 @@
 {
   "stt": {
-    "model_size": "small",
+    "model_size": "base",
     "device": "cpu",
     "compute_type": "int8"
   },
   "llm": {
     "model_path": "models/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf",
-    "n_ctx": 1024,
-    "max_tokens": 150,
+    "n_ctx": 384,
+    "max_tokens": 100,
     "temperature": 0.8,
-    "n_threads": 4
+    "n_threads": 4,
+    "n_batch": 8
   },
   "tts": {
     "mode": "1",
     "preset_filename": "Інна Гелевера.pt",
     "reference_filename": "sample.wav",
     "speed": 1.1,
-    "noise_scale": 0.0,
+    "noise_scale": 0.05,
     "match_duration": false,
-    "use_verbalizer": true
+    "use_verbalizer": false
   },
   "character": {
-    "name": "Помічниця",
-    "system_prompt": "Ти — зухвала цифрова асистентка. Відповідай дуже коротко (1-2 речення), українською мовою, використовуй сарказм та гумор."
+    "name": "Селті",
+    "system_prompt": "Ти — зухвала цифрова асистентка. Відповідай дуже коротко (1-2 речення), українською мовою, граматично вірно, використовуй сарказм та гумор."
   }
 }

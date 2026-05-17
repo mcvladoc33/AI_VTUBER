@@ -1,8 +1,8 @@
 import os
-import re
 import sys
 import warnings
 import logging
+import re
 
 # =====================================================================
 # 🛠️ КРИТИЧНИЙ ПАТЧ ДЛЯ FFMPEG (Має відпрацювати до імпорту pydub)
@@ -85,7 +85,7 @@ class TTSHandler:
         self.speed = self.tts_config.get("speed", 1.0)
         self.noise_scale = self.tts_config.get("noise_scale", 0.1)
         self.match_duration = self.tts_config.get("match_duration", False)
-        self.use_verbalizer = self.tts_config.get("use_verbalizer", True)
+        self.use_verbalizer = self.tts_config.get("use_verbalizer", False)  # Вимикаємо за замовчуванням
 
         self.verbalizer_model = None
         self.tokenizer = None
@@ -104,6 +104,15 @@ class TTSHandler:
 
         from styletts2_inference.models import StyleTTS2
         self.multi_model = StyleTTS2(hf_path=self.styletts_path, device=self.device)
+
+        # Спроба внутрішньої підміни (не заважає виконанню, якщо обгортка проігнорує)
+        try:
+            if hasattr(self.multi_model, 'model'):
+                self.multi_model.model.diffusion_steps = 5
+                if hasattr(self.multi_model.model, 'args'):
+                    self.multi_model.model.args.diffusion_steps = 5
+        except:
+            pass
 
         self.stressify = Stressifier()
         self.ipa_func = ipa
@@ -151,7 +160,6 @@ class TTSHandler:
             return
 
         try:
-            # 🧹 Текстовий фільтр проти збоїв нульових тензорів та емодзі
             clean_text = text.strip()
             clean_text = re.sub(r'\.{2,}', '.', clean_text)
             clean_text = re.sub(r'[^\w\s\d.,!?;:()\-—–\'"\«\»]', '', clean_text)
@@ -214,6 +222,7 @@ class TTSHandler:
                     if self.noise_scale > 0:
                         current_style += torch.randn_like(current_style) * self.noise_scale
 
+                    # Викликаємо стандартно, без конфліктних ключових слів
                     wav = self.multi_model(tokens, speed=final_speed, s_prev=current_style)
                     result_wav.append(wav.cpu().numpy().flatten())
 
@@ -242,7 +251,6 @@ class TTSHandler:
                 print(f"⚠️ [TTS] Не вдалося експортувати MP3: {mp3_err}")
 
             sd.wait()
-            print("🔊 [TTS] Програвання голосу завершено.")
 
         except Exception as e:
             print(f"❌ ПОМИЛКА [TTS] Критичний збій синтезу: {e}")
