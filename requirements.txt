@@ -1,6 +1,24 @@
-# Requires: Python == 3.11.*
-numpy>=1.24.0
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+numpy<2
 sounddevice>=0.4.6
 scipy>=1.10.0
+soundfile
+librosa
+pydub
+
+# Моделі розпізнавання (STT) та мислення (LLM)
 faster-whisper>=0.10.0
 llama-cpp-python>=0.2.50
+
+# Лінгвістика та ШІ-озвучка голосу (StyleTTS2 UA)
+torch
+torchaudio
+num2word
+num2words
+transformers
+sentencepiece
+pyyaml
+git+https://github.com/patriotyk/ukrainian-word-stress.git
+git+https://github.com/patriotyk/ipa-uk.git
+git+https://github.com/patriotyk/styletts2-inference@105aed29fa1a7698d08d920986890e9bbd03447c

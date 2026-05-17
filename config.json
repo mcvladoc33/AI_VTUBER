@@ -7,9 +7,18 @@
   "llm": {
     "model_path": "models/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf",
     "n_ctx": 1024,
-    "max_tokens": 60,
+    "max_tokens": 150,
     "temperature": 0.8,
     "n_threads": 4
+  },
+  "tts": {
+    "mode": "1",
+    "preset_filename": "Інна Гелевера.pt",
+    "reference_filename": "sample.wav",
+    "speed": 1.1,
+    "noise_scale": 0.0,
+    "match_duration": false,
+    "use_verbalizer": true
   },
   "character": {
     "name": "Помічниця",

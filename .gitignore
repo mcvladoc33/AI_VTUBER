@@ -13,3 +13,5 @@ models/
 # Тимчасові файли аудіо та кешу Python
 __pycache__/
 *.wav
+*.mp3
+/input/
