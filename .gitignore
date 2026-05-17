@@ -1,3 +1,15 @@
-/models/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf
-/.venv/
-/.idea/
+# Ігноруємо віртуальне оточення
+.venv/
+venv/
+
+# Ігноруємо налаштування середовища розробки (PyCharm / VS Code)
+.idea/
+.vscode/
+
+# Ігноруємо важкі моделі ШІ
+models/
+*.gguf
+
+# Тимчасові файли аудіо та кешу Python
+__pycache__/
+*.wav
