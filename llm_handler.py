@@ -2,7 +2,6 @@ import os
 import sys
 from llama_cpp import Llama
 
-
 class LLMHandler:
     def __init__(self, config):
         self.llm_config = config.get('llm', {})
@@ -16,7 +15,6 @@ class LLMHandler:
 
         print(f"🧠 [LLM] Завантаження моделі {self.character_name}...")
 
-        # Повністю глушимо вивід C++ логів llama.cpp у консоль Windows
         sys.stdout.flush()
         old_stdout = os.dup(1)
         old_stderr = os.dup(2)
@@ -27,10 +25,10 @@ class LLMHandler:
 
                 self.model = Llama(
                     model_path=self.llm_config['model_path'],
-                    n_ctx=384,  # Мінімальний контекст для максимальної швидкості CPU
-                    n_threads=4,  # Використовуємо 4 фізичні ядра процесора
-                    n_batch=8,  # Маленький батч полегшує потокову генерацію
-                    verbose=False  # Вимикає базовий verbose логгер
+                    n_ctx=self.llm_config.get('n_ctx', 512),
+                    n_threads=4,
+                    n_batch=self.llm_config.get('n_batch', 16),
+                    verbose=False
                 )
         finally:
             os.dup2(old_stdout, 1)
@@ -41,10 +39,6 @@ class LLMHandler:
         print("✅ [LLM] Модель мислення готова.")
 
     def generate_response(self, text: str):
-        """
-        Генерує відповідь у режимі стрімінгу. Накопичує короткі вигуки
-        (менше 40 символів), щоб мова не була рваною, і віддає повноцінні речення.
-        """
         if not self.model:
             yield "Помилка: Модель ШІ не завантажена."
             return
@@ -54,30 +48,21 @@ class LLMHandler:
         response_stream = self.model(
             prompt=prompt,
             max_tokens=self.llm_config.get('max_tokens', 150),
-            temperature=0.8,
-            stop=["User:", "System:"],
-            stream=True,  # Вмикаємо потокову віддачу токенів
+            temperature=self.llm_config.get('temperature', 0.7),
+            stop=["User:", "System:", "Assistant:", "\nUser"],
+            stream=True,
             echo=False
         )
 
-        sentence_buffer = ""
-        sentence_endings = {'.', '!', '?', '\n'}
-
+        token_buffer = ""
         for chunk in response_stream:
             token = chunk["choices"][0]["text"]
-            sentence_buffer += token
+            token_buffer += token
 
-            # Якщо знайшли розділовий знак в поточному токені
-            if any(char in token for char in sentence_endings):
-                clean_buffer = sentence_buffer.strip()
+            # Віддаємо текст ТІЛЬКИ коли є повноцінне завершене речення
+            if any(c in token for c in ['.', '!', '?', '\n']) and len(token_buffer.strip()) > 20:
+                yield token_buffer.strip()
+                token_buffer = ""
 
-                # Перевіряємо, чи в буфері є хоча б 40 символів і чи є там літери/цифри
-                # (щоб ігнорувати порожні смайли чи набори розділових знаків)
-                if len(clean_buffer) >= 40 and any(c.isalnum() for c in clean_buffer):
-                    yield clean_buffer
-                    sentence_buffer = ""
-
-        # Віддаємо фінальний залишок тексту, тільки якщо там є реальний текст (букви/цифри)
-        final_clean = sentence_buffer.strip()
-        if final_clean and any(c.isalnum() for c in final_clean):
-            yield final_clean
+        if token_buffer.strip():
+            yield token_buffer.strip()
