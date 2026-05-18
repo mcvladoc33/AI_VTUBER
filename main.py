@@ -1,31 +1,23 @@
 import os
 import sys
 import time
-
-# 🔥 Збільшуємо кількість потоків до 4. Оскільки mBART вимкнено в config.json,
-# ядра процесора більше не конфліктують, а віддають всю потужність на 50 кроків StyleTTS2.
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-os.environ["OMP_NUM_THREADS"] = "4"
-os.environ["MKL_NUM_THREADS"] = "4"
-
 import json
-import torch
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
+
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 from audio_handler import AudioHandler
 from llm_handler import LLMHandler
 from tts_handler import TTSHandler
-
-# Налаштовуємо PyTorch на використання фізичних ядер вашого CPU
-torch.set_num_threads(4)
-torch.set_num_interop_threads(4)
 
 CONFIG_PATH = "config.json"
 TEMP_AUDIO_PATH = os.path.join("input", "temp_voice.wav")
 
 
-def record_microphone(filename, sample_rate=16000, threshold=0.02, silence_duration=1.2):
+def record_microphone_clean(filename, sample_rate=16000, threshold=0.05, silence_duration=1.2):
+    """Класичний послідовний запис мікрофона без фонових потоків та конфліктів заліза"""
     os.makedirs(os.path.dirname(filename), exist_ok=True)
     chunk_size = 1024
     audio_buffer = []
@@ -63,13 +55,13 @@ def record_microphone(filename, sample_rate=16000, threshold=0.02, silence_durat
     if audio_buffer:
         recording = np.concatenate(audio_buffer, axis=0)
         sf.write(filename, recording, sample_rate)
-    else:
-        sf.write(filename, np.zeros((sample_rate, 1)), sample_rate)
+        return "AUDIO_RECORDED"
+    return "EMPTY"
 
 
 def main():
     if not os.path.exists(CONFIG_PATH):
-        print("❌ Помилка: config.json не знайдено!")
+        print(f"❌ Помилка: {CONFIG_PATH} не знайдено!")
         return
 
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -81,22 +73,40 @@ def main():
 
     char_name = config.get('character', {}).get('name', 'Помічниця')
 
+    # Зчитуємо режим роботи прямо з конфігу
+    text_mode = config.get('text_mode', False)
+
     print("\n🚀 [SYSTEM] Помічниця повністю готова до роботи!")
+    if text_mode:
+        print("👉 Режим: ТЕКСТОВИЙ (вводь текст у консоль та тисни Enter).")
+    else:
+        print("👉 Режим: МІКРОФОН (просто починай говорити, коли з'явиться індикатор).")
     print("--------------------------------------------------")
 
     while True:
         try:
-            print("🟢 Очікую ваш голос...")
-            record_microphone(TEMP_AUDIO_PATH, threshold=0.02, silence_duration=1.2)
+            tts_module.reset_session()
 
-            start_stt = time.time()
-            user_input = stt_module.transcribe_audio(TEMP_AUDIO_PATH)
-            stt_time = time.time() - start_stt
+            if text_mode:
+                print("🟢 Очікую ваш текст...")
+                user_input = input("👤 Ви: ").strip()
+                if not user_input:
+                    continue
+            else:
+                print("🟢 Очікую ваш голос...")
+                status = record_microphone_clean(TEMP_AUDIO_PATH, threshold=0.05, silence_duration=1.2)
 
-            if not user_input or len(user_input.strip()) < 2:
-                continue
+                if status == "AUDIO_RECORDED":
+                    start_stt = time.time()
+                    user_input = stt_module.transcribe_audio(TEMP_AUDIO_PATH)
+                    stt_time = time.time() - start_stt
 
-            print(f"👤 Ви: {user_input} [STT: {stt_time:.2f}s]")
+                    if not user_input or len(user_input.strip()) < 2:
+                        continue
+                    print(f"👤 Ви: {user_input} [STT: {stt_time:.2f}s]")
+                else:
+                    continue
+
             print(f"🤖 {char_name}:")
 
             is_first_sentence = True
@@ -108,25 +118,25 @@ def main():
                     print(f" ⏱️ [Пошук думки: {llm_first_token_time:.2f}s]")
                     is_first_sentence = False
 
-                # Друкуємо речення на екран
                 print(f" ➔ {sentence}")
 
-                # Озвучуємо речення через виправлений tts_handler
                 start_tts = time.time()
                 try:
-                    tts_module.generate_speech(sentence)
+                    tts_module.play_text_async(sentence)
                     tts_time = time.time() - start_tts
-                    print(f"   └─ 🔊 [Синтез голосу за: {tts_time:.2f}s]")
+                    print(f"   └─ 🔊 [Речення передано в TTS за: {tts_time:.4f}s]")
                 except Exception as tts_err:
                     print(f"   └─ ❌ [Помилка TTS]: {tts_err}")
 
+            # Чекаємо, поки Селті повністю договорить речення в плеєрі
+            tts_module.wait_until_done()
             print("\n--------------------------------------------------")
 
         except KeyboardInterrupt:
             print("\n👋 Роботу завершено. Бувай!")
             break
         except Exception as e:
-            print(f"❌ Помилка: {e}")
+            print(f"❌ Помилка в головному циклі: {e}")
 
 
 if __name__ == "__main__":

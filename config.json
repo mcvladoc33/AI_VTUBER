@@ -1,28 +1,29 @@
 {
   "stt": {
-    "model_size": "base",
+    "model_size": "small",
     "device": "cpu",
     "compute_type": "int8"
   },
   "llm": {
     "model_path": "models/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf",
-    "n_ctx": 384,
-    "max_tokens": 100,
-    "temperature": 0.8,
+    "n_ctx": 1024,
+    "max_tokens": 180,
+    "temperature": 0.65,
     "n_threads": 4,
-    "n_batch": 8
+    "n_batch": 16
   },
   "tts": {
     "mode": "1",
     "preset_filename": "Інна Гелевера.pt",
     "reference_filename": "sample.wav",
-    "speed": 1.1,
+    "speed": 1.25,
     "noise_scale": 0.05,
     "match_duration": false,
     "use_verbalizer": false
   },
   "character": {
     "name": "Селті",
-    "system_prompt": "Ти — зухвала цифрова асистентка. Відповідай дуже коротко (1-2 речення), українською мовою, граматично вірно, використовуй сарказм та гумор."
-  }
+    "system_prompt": "Ти — зухвала та іронічна цифрова асистентка Селті. Твоє завдання — відповідати лаконічно, ємно та саркастично розмовною українською мовою. Твоя відповідь має складатися строго з 2-3 коротких речень. Якщо у тебе просять рецепт чи інструкцію — спершу уїдливо підколи, а потім одразу накидай саму суть (перелік інгредієнтів чи дій) дуже стисло, в одне речення. Пиши виключно звичайним текстом без маркдауну, лапок, дужок чи приміток."
+  },
+  "text_mode": false
 }

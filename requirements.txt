@@ -14,7 +14,6 @@ llama-cpp-python>=0.2.50
 # Лінгвістика та ШІ-озвучка голосу (StyleTTS2 UA)
 torch
 torchaudio
-num2word
 num2words
 transformers
 sentencepiece
