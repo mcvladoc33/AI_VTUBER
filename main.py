@@ -24,11 +24,14 @@ llm_to_tts_queue = queue.Queue()
 stop_event = threading.Event()
 interrupt_event = threading.Event()
 
+# Список слів, які мають право примусово перебити або зупинити Селті
+STOP_WORDS = ["стоп", "stop", "досить", "зупинись", "замовкни", "харе", "поп", "порохуй"]
 
-def record_microphone_core(filename, tts_module, sample_rate=16000, threshold=0.033, silence_duration=1.5):
+
+def record_microphone_core(filename, sample_rate=16000, threshold=0.033, silence_duration=1.5):
     """
-    Покращений запис мікрофону із захистом від ковтання перших складів фраз (Pre-recording Buffer).
-    Пауза очікування розширена до 1.5 секунд.
+    Запис мікрофону. Більше НЕ перериває TTS автоматично при будь-якому звуці.
+    Селті продовжує говорити, поки мікрофон фоном слухає команду СТОП.
     """
     os.makedirs(os.path.dirname(filename), exist_ok=True)
     chunk_size = 1024
@@ -56,14 +59,7 @@ def record_microphone_core(filename, tts_module, sample_rate=16000, threshold=0.
                         pre_record_buffer.pop(0)
 
                     if volume_norm > threshold:
-                        if tts_module.is_playing():
-                            log.warning("\n🛑 [SYSTEM] Користувач перебиває Селті! Зупинка відтворення...")
-                            interrupt_event.set()
-                            tts_module.stop()
-
-                        log.info("🎙️ [Мікрофон] Голос зафіксовано, запис...")
                         is_speaking = True
-
                         if pre_record_buffer:
                             audio_buffer.extend(pre_record_buffer)
                         audio_buffer.append(current_chunk)
@@ -94,15 +90,16 @@ def input_stt_worker(text_mode, stt_module, tts_module):
                 user_input = input("👤 Ви: ").strip()
                 if not user_input: continue
 
-                if user_input.lower() in ["стоп", "stop", "досить"]:
-                    log.warning("🛑 [SYSTEM] Отримано команду СТОП.")
+                if user_input.lower() in STOP_WORDS:
+                    log.warning("🛑 [SYSTEM] Отримано текстову команду СТОП.")
                     interrupt_event.set()
                     tts_module.stop()
                     continue
 
                 stt_to_llm_queue.put(user_input)
             else:
-                if record_microphone_core(TEMP_AUDIO_PATH, tts_module, threshold=0.033, silence_duration=1.5):
+                # Викликаємо ядро запису (воно тепер пасивне, не гасить звук само по собі)
+                if record_microphone_core(TEMP_AUDIO_PATH, threshold=0.033, silence_duration=1.5):
                     if stop_event.is_set(): break
 
                     start_stt = time.time()
@@ -112,13 +109,16 @@ def input_stt_worker(text_mode, stt_module, tts_module):
                     if not user_input or len(user_input.strip()) < 2:
                         continue
 
-                    clean_text = user_input.lower().strip().replace(".", "").replace("!", "")
-                    if clean_text in ["стоп", "stop", "топ", "тоб", "досить", "добаво", "порохуй"]:
-                        log.warning("🛑 [SYSTEM] Перехоплено команду СТОП. Скидання конвеєра.")
+                    # Перевіряємо, чи розпізнаний текст містить команду СТОП
+                    clean_text = user_input.lower().strip().replace(".", "").replace("!", "").replace(",", "")
+                    is_stop_command = any(word in clean_text for word in STOP_WORDS)
+
+                    if is_stop_command:
+                        log.warning(f"🛑 [SYSTEM] Перехоплено команду СТОП ('{user_input}'). Скидання конвеєра.")
                         interrupt_event.set()
                         tts_module.stop()
 
-                        # Моментальний скид черг, щоб очистити беклог
+                        # Моментально чистимо беклог черг
                         while not stt_to_llm_queue.empty():
                             try:
                                 stt_to_llm_queue.get_nowait(); stt_to_llm_queue.task_done()
@@ -131,7 +131,12 @@ def input_stt_worker(text_mode, stt_module, tts_module):
                                 break
                         continue
 
-                    log.info(f"👤 Ви: {user_input} [STT розпізнано за: {stt_time:.2f}s]")
+                    # Якщо Селті щось активно говорила в цей момент, а ми сказали НЕ команду стоп —
+                    # ми просто ігноруємо цей ввід як випадковий шум/перебивання, щоб не збивати її з думки.
+                    if tts_module.is_playing():
+                        continue
+
+                    log.info(f"\n👤 Ви: {user_input} [STT: {stt_time:.2f}s]")
                     stt_to_llm_queue.put(user_input)
         except Exception as e:
             log.error(f"❌ Помилка в Потоці STT: {e}")
@@ -147,7 +152,6 @@ def llm_processing_worker(llm_module, char_name):
             except queue.Empty:
                 continue
 
-            # 🔥 НАЙВАЖЛИВІШЕ: Скидаємо прапорець переривання ПЕРЕД початком нової генерації
             interrupt_event.clear()
 
             log.info(f"🧠 [LLM] {char_name} формує відповідь...")
@@ -162,7 +166,7 @@ def llm_processing_worker(llm_module, char_name):
                     log.info(f" ⏱️ [Перший токен через: {time.time() - start_llm:.2f}s]")
                     is_first = False
 
-                log.info(f" ➔ {sentence}")
+                log.info(f"  ➔ {sentence}")
                 llm_to_tts_queue.put(sentence)
 
             stt_to_llm_queue.task_done()
@@ -184,11 +188,9 @@ def tts_render_worker(tts_module):
                 llm_to_tts_queue.task_done()
                 continue
 
-            start_tts = time.time()
             try:
                 tts_module.reset_session()
                 tts_module.play_text_async(sentence)
-                log.info(f"    🔊 [Надіслано в буфер StyleTTS2 за: {time.time() - start_tts:.4f}s]")
 
                 while tts_module.is_playing():
                     if interrupt_event.is_set() or stop_event.is_set():
@@ -228,7 +230,7 @@ def main():
     char_name = config.get('character', {}).get('name', 'Селті')
     text_mode = config.get('text_mode', False)
 
-    log.info("\n🚀 [SYSTEM] Модулі зв'язані через LinkedQueues. Запуск асинхронних конвеєрів...")
+    log.info("\n🚀 [SYSTEM] Запуск асинхронних конвеєрів...")
     log.info("-" * 60)
 
     t1 = threading.Thread(target=input_stt_worker, args=(text_mode, stt_module, tts_module), daemon=True)

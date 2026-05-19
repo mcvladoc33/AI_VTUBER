@@ -23,7 +23,8 @@ class AudioHandler:
         if not os.path.exists(audio_path):
             return ""
 
-        streamer_prompt = "Селті, привіт! Що там, як справи, розкажи."
+        # 🔥 Сухий технічний промпт захищає від появи лівих фраз під час зітхань або шуму
+        technical_prompt = "Розмовна українська мова, чіткі репліки без галюцинацій."
 
         segments, info = self.model.transcribe(
             audio_path,
@@ -32,14 +33,15 @@ class AudioHandler:
             beam_size=5,
             best_of=5,
             temperature=0.0,
-            initial_prompt=streamer_prompt,
-            no_speech_threshold=0.5,
+            initial_prompt=technical_prompt,
+            no_speech_threshold=0.6,  # Трохи підняли поріг відсікання тиші/шуму
             compression_ratio_threshold=2.4
         )
 
         text = "".join([segment.text for segment in segments]).strip()
         text = text.replace(" ?", "?").replace(" !", "!").replace(" .", ".")
 
+        # Жорсткий чорний список для фраз-привидів
         hallucination_blacklist = [
             "дякую за перегляд",
             "продовження випливає",
@@ -47,10 +49,12 @@ class AudioHandler:
             "редактор",
             "підписуйтесь",
             "бувай",
-            "привіт"
+            "що там як справи",
+            "що там як справи розкажи",
+            "розмовна українська мова"
         ]
 
-        clean_check = text.lower().strip().replace(".", "").replace("!", "").replace("?", "")
+        clean_check = text.lower().strip().replace(".", "").replace("!", "").replace("?", "").replace(",", "")
 
         if len(clean_check) <= 2 or clean_check in hallucination_blacklist:
             return ""

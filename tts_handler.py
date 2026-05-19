@@ -22,9 +22,6 @@ import styletts2_inference.models
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# ----------------------------------------------------------------------------------
-# 🔥 РОЗУМНИЙ ГЛОБАЛЬНИЙ ХУК: ЗАХИСТ ВІД UnicodeDecodeError БЕЗ КРАШУ БІНАРНИХ ФАЙЛІВ
-# ----------------------------------------------------------------------------------
 import builtins
 import yaml
 
@@ -52,8 +49,6 @@ def patch_yaml_load(stream, *args, **kwargs):
 yaml.safe_load = patch_yaml_load
 builtins.open = robust_utf8_open
 
-
-# ----------------------------------------------------------------------------------
 
 def fake_hf_hub_download(repo_id, filename, **kwargs):
     return os.path.join(BASE_DIR, "models", "styletts2_ukrainian_multispeaker", filename)
@@ -90,9 +85,10 @@ class TTSHandler:
         from styletts2_inference.models import StyleTTS2
         self.multi_model = StyleTTS2(hf_path=self.styletts_path, device=self.device)
 
+        # 🔥 ЕКСТРЕМАЛЬНЕ ПРИСКОРЕННЯ ДЛЯ CPU: Зменшуємо кроки дифузії до мінімуму (1-2 кроки)
         try:
             if hasattr(self.multi_model, 'model'):
-                self.multi_model.model.diffusion_steps = 3
+                self.multi_model.model.diffusion_steps = 1  # Надшвидкий рендеринг
         except:
             pass
 
@@ -123,6 +119,14 @@ class TTSHandler:
                 continue
 
             try:
+                # 🔥 Захист від поганої інтонації на ультра-коротких словах
+                clean_word = text.strip().replace(".", "").replace("!", "").replace("?", "")
+                if len(clean_word.split()) == 1:
+                    if clean_word.lower() in ["так", "ні", "борщ", "окей", "добре", "груба"]:
+                        text = f"Ну, {clean_word.lower()}."  # Додаємо штучний контекст для плавності звуку
+
+                start_tts = time.time()
+
                 t_norm = normalize('NFKC', text.replace('+', StressSymbol.CombiningAcuteAccent))
                 ps = self.ipa_func(self.stressify(t_norm))
 
@@ -137,6 +141,8 @@ class TTSHandler:
                         continue
 
                     audio_chunk = wav.cpu().numpy().flatten()
+
+                    log.info(f"    🔊 [TTS згенеровано за: {time.time() - start_tts:.2f}s] ➔ Склади: {len(tokens)}")
 
                     if not self.interrupted:
                         self.audio_queue.put(audio_chunk)
