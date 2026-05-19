@@ -11,7 +11,7 @@ class LLMHandler:
         self.llm_config = config.get('llm', {})
         self.char_config = config.get('character', {})
         self.history = []
-        self.max_history_turns = 10
+        self.max_history_turns = 4
 
         model_path = self.llm_config.get('model_path', '')
         if not os.path.exists(model_path):
