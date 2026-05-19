@@ -30,6 +30,7 @@ class LLMHandler:
                     model_path=model_path,
                     n_ctx=self.llm_config.get('n_ctx', 2048),
                     n_threads=self.llm_config.get('n_threads', 4),
+                    n_threads_batch=self.llm_config.get('n_threads_batch', 4),
                     n_batch=self.llm_config.get('n_batch', 32),
                     f16_kv=True,
                     verbose=False
@@ -80,6 +81,7 @@ class LLMHandler:
             prompt=prompt,
             max_tokens=self.llm_config.get('max_tokens', 250),
             temperature=self.llm_config.get('temperature', 0.7),
+            repeat_penalty=self.llm_config.get('repeat_penalty', 1.15),
             stop=["User:", "System:", "Assistant:", "\nUser"],
             stream=True
         )
@@ -102,7 +104,7 @@ class LLMHandler:
 
                     # ГРУПУВАННЯ: Якщо назбиралося менше 35 символів (поодинокі слова),
                     # ми НЕ віддаємо їх в TTS, а чекаємо наступного токена для склеювання.
-                    if len(clean_sentence) >= 35:
+                    if len(clean_sentence) >= 20:
                         yield clean_sentence
                         full_response += " " + clean_sentence
                         token_buffer = ""

@@ -3,6 +3,9 @@ import sys
 import warnings
 import torch
 import numpy as np
+
+torch.set_num_interop_threads(1)
+
 import sounddevice as sd
 import threading
 import queue
@@ -58,6 +61,9 @@ class TTSHandler:
     def __init__(self, config):
         self.config = config
         self.tts_config = config.get('tts', {})
+
+        tts_threads = self.tts_config.get("n_threads", 3)  # 3 за замовчуванням
+        torch.set_num_threads(tts_threads)
 
         self.text_queue = queue.Queue()
         self.audio_queue = queue.Queue()
