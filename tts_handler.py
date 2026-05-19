@@ -1,19 +1,16 @@
 import os
 import sys
 import warnings
-
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", category=FutureWarning)
-
 import torch
 import numpy as np
 import sounddevice as sd
-import soundfile as sf
-import re
 import threading
 import queue
 import time
 from unicodedata import normalize
+
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 from logger_config import log
 from ipa_uk import ipa
@@ -69,28 +66,25 @@ class TTSHandler:
         self.preset_dir = os.path.join(BASE_DIR, "voices")
         self.output_dir = os.path.join(BASE_DIR, "outputs")
 
-        os.makedirs(self.preset_dir, exist_ok=True)
-        os.makedirs(self.output_dir, exist_ok=True)
-
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         log.info(f"📥 [TTS] Ініціалізація StyleTTS2 UA на девайсі: {self.device.upper()}")
 
-        self.speed = self.tts_config.get("speed", 1.30)
+        self.speed = self.tts_config.get("speed", 1.15)
         self.noise_scale = self.tts_config.get("noise_scale", 0.05)
 
-        self.is_first_chunk = True
         self.interrupted = False
         self._is_playing_now = False
 
         from styletts2_inference.models import StyleTTS2
         self.multi_model = StyleTTS2(hf_path=self.styletts_path, device=self.device)
 
-        # 🔥 ЕКСТРЕМАЛЬНЕ ПРИСКОРЕННЯ ДЛЯ CPU: Зменшуємо кроки дифузії до мінімуму (1-2 кроки)
         try:
-            if hasattr(self.multi_model, 'model'):
-                self.multi_model.model.diffusion_steps = 1  # Надшвидкий рендеринг
-        except:
-            pass
+            if hasattr(self.multi_model, 'model') and self.multi_model.model is not None:
+                self.multi_model.model.diffusion_steps = 1
+                if hasattr(self.multi_model.model, 'sampler'):
+                    self.multi_model.model.sampler.steps = 1
+        except Exception as e:
+            log.warning(f"⚠️ Не вдалося примусово зрізати кроки дифузії: {e}")
 
         self.stressify = Stressifier()
         self.ipa_func = ipa
@@ -119,21 +113,13 @@ class TTSHandler:
                 continue
 
             try:
-                # 🔥 Захист від поганої інтонації на ультра-коротких словах
-                clean_word = text.strip().replace(".", "").replace("!", "").replace("?", "")
-                if len(clean_word.split()) == 1:
-                    if clean_word.lower() in ["так", "ні", "борщ", "окей", "добре", "груба"]:
-                        text = f"Ну, {clean_word.lower()}."  # Додаємо штучний контекст для плавності звуку
-
                 start_tts = time.time()
-
                 t_norm = normalize('NFKC', text.replace('+', StressSymbol.CombiningAcuteAccent))
                 ps = self.ipa_func(self.stressify(t_norm))
 
                 if ps and not self.interrupted:
                     tokens = self.multi_model.tokenizer.encode(ps)
                     current_style = self.style.clone() if self.style is not None else None
-
                     wav = self.multi_model(tokens, speed=self.speed, s_prev=current_style)
 
                     if self.interrupted:
@@ -141,12 +127,10 @@ class TTSHandler:
                         continue
 
                     audio_chunk = wav.cpu().numpy().flatten()
-
                     log.info(f"    🔊 [TTS згенеровано за: {time.time() - start_tts:.2f}s] ➔ Склади: {len(tokens)}")
 
                     if not self.interrupted:
                         self.audio_queue.put(audio_chunk)
-
             except Exception as e:
                 log.error(f"❌ Помилка всередині обробника тексту TTS: {e}")
 
@@ -156,15 +140,24 @@ class TTSHandler:
         while True:
             audio_data = self.audio_queue.get()
             if audio_data is None: continue
-
             if self.interrupted:
                 self.audio_queue.task_done()
                 continue
-
             try:
                 self._is_playing_now = True
                 sd.play(audio_data, 24000)
-                sd.wait()
+
+                # Повертаємо класичний, стабільний контроль потоку
+                while not self.interrupted:
+                    try:
+                        if not sd.get_stream().active:
+                            break
+                    except:
+                        break
+                    time.sleep(0.005)
+
+                if self.interrupted:
+                    sd.stop()
             except:
                 pass
             finally:
@@ -190,21 +183,16 @@ class TTSHandler:
             sd.stop()
         except:
             pass
-
         while not self.text_queue.empty():
             try:
-                self.text_queue.get_nowait()
-                self.text_queue.task_done()
+                self.text_queue.get_nowait(); self.text_queue.task_done()
             except queue.Empty:
                 break
-
         while not self.audio_queue.empty():
             try:
-                self.audio_queue.get_nowait()
-                self.audio_queue.task_done()
+                self.audio_queue.get_nowait(); self.audio_queue.task_done()
             except queue.Empty:
                 break
-
         self._is_playing_now = False
         log.warning("🛑 [TTS] Усі звукові черги повністю очищено та зупинено.")
 
