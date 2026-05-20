@@ -25,7 +25,7 @@ interrupt_event = asyncio.Event()
 STOP_WORDS = ["стоп", "stop", "досить", "зупинись", "замовкни", "харе", "поп", "порохуй"]
 
 
-def record_microphone_core(filename, sample_rate=16000, threshold=0.033, silence_duration=1.5):
+def record_microphone_core(filename, sample_rate=16000, threshold=0.033, silence_duration=1.0):
     os.makedirs(os.path.dirname(filename), exist_ok=True)
     chunk_size = 1024
     audio_buffer = []
@@ -92,7 +92,7 @@ async def input_stt_worker(text_mode, stt_module, tts_module):
 
                 await stt_to_llm_queue.put(user_input)
             else:
-                recorded = await asyncio.to_thread(record_microphone_core, TEMP_AUDIO_PATH, 16000, 0.033, 1.5)
+                recorded = await asyncio.to_thread(record_microphone_core, TEMP_AUDIO_PATH, 16000, 0.033, 1.0)
                 if recorded:
                     if stop_event.is_set(): break
 
@@ -155,7 +155,6 @@ async def llm_processing_worker(llm_module, char_name):
                 if interrupt_event.is_set() or stop_event.is_set():
                     break
 
-                    # Отримуємо кортеж (речення, час_генерації)
                 result = await asyncio.to_thread(get_next_sentence, gen)
                 if result is None:
                     break
@@ -166,7 +165,6 @@ async def llm_processing_worker(llm_module, char_name):
                     log.info(f" ⏱️ [Перший токен через: {t.time() - start_llm:.2f}s]")
                     is_first = False
 
-                    # Виводимо індивідуальний час створення конкретно цієї репліки
                 log.info(f"  ➔ {sentence} [Генерація: {gen_time:.2f}s]")
                 await llm_to_tts_queue.put(sentence)
 
