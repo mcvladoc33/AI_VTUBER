@@ -108,16 +108,15 @@ async def input_stt_worker(text_mode, stt_module, tts_module):
                     is_stop_command = any(word in clean_text for word in STOP_WORDS)
 
                     if is_stop_command:
-                        log.warning(f"🛑 [SYSTEM] Перехоплено команду СТОП ('{user_input}'). Скидання конвеєра.")
+                        log.warning(f"🛑 [SYSTEM] Перехоплено команду СТОП. Скидання.")
                         interrupt_event.set()
                         await asyncio.to_thread(tts_module.stop)
 
-                        while not stt_to_llm_queue.empty():
-                            stt_to_llm_queue.get_nowait()
-                        while not llm_to_tts_queue.empty():
-                            llm_to_tts_queue.get_nowait()
+                        while not stt_to_llm_queue.empty(): stt_to_llm_queue.get_nowait()
+                        while not llm_to_tts_queue.empty(): llm_to_tts_queue.get_nowait()
                         continue
 
+                        # Блокуємо введення, якщо Селті ще говорить або в її чергах є завдання
                     if await asyncio.to_thread(tts_module.is_playing):
                         continue
 
@@ -160,7 +159,6 @@ async def llm_processing_worker(llm_module, char_name):
                     break
 
                 sentence, gen_time = result
-
                 if is_first:
                     log.info(f" ⏱️ [Перший токен через: {t.time() - start_llm:.2f}s]")
                     is_first = False
@@ -173,33 +171,32 @@ async def llm_processing_worker(llm_module, char_name):
             log.error(f"❌ Помилка в Задачі LLM: {e}")
             await asyncio.sleep(1)
 
+        # СПРАВЖНІЙ КОНВЕЄР: Просто перекидає речення у внутрішній буфер TTSHandler
 
-async def tts_render_worker(tts_module):
-    log.info("🟢 [Задача 3: Озвучка/TTS] Успішно запущено.")
+
+async def tts_pipeline_worker(tts_module):
+    log.info("🟢 [Задача 3: Конвеєр Синтезу] Успішно запущено.")
     while not stop_event.is_set():
         try:
             sentence = await llm_to_tts_queue.get()
-
             if interrupt_event.is_set():
                 llm_to_tts_queue.task_done()
                 continue
 
-            try:
-                await asyncio.to_thread(tts_module.reset_session)
-                await asyncio.to_thread(tts_module.play_text_async, sentence)
+            if len(sentence.strip()) < 6:
+                llm_to_tts_queue.task_done()
+                continue
 
-                while await asyncio.to_thread(tts_module.is_playing):
-                    if interrupt_event.is_set() or stop_event.is_set():
-                        await asyncio.to_thread(tts_module.stop)
-                        break
-                    await asyncio.sleep(0.02)
+                # Скидаємо прапорець переривання перед відправкою нової фрази
+            await asyncio.to_thread(tts_module.reset_session)
 
-            except Exception as tts_err:
-                log.error(f"❌ Помилка синтезу мовлення: {tts_err}")
+            # play_text_async просто миттєво кладе текст у чергу тексту всередині TTSHandler.
+            # Внутрішній _text_processing_worker почне генерувати звук у фоні НАПЕРЕД!
+            await asyncio.to_thread(tts_module.play_text_async, sentence)
 
             llm_to_tts_queue.task_done()
         except Exception as e:
-            log.error(f"❌ Помилка в Задачі TTS: {e}")
+            log.error(f"❌ Помилка в Задачах конвеєра TTS: {e}")
             await asyncio.sleep(1)
 
 
@@ -232,7 +229,7 @@ async def main_async():
     tasks = [
         asyncio.create_task(input_stt_worker(text_mode, stt_module, tts_module)),
         asyncio.create_task(llm_processing_worker(llm_module, char_name)),
-        asyncio.create_task(tts_render_worker(tts_module))
+        asyncio.create_task(tts_pipeline_worker(tts_module))
     ]
 
     log.info("🚀 [SYSTEM] Роботу конвеєра стабілізовано. Можна починати діалог!")
@@ -246,8 +243,7 @@ async def main_async():
         log.warning("\n👋 Завершення роботи програми...")
         stop_event.set()
         await asyncio.to_thread(tts_module.stop)
-        for task in tasks:
-            task.cancel()
+        for task in tasks: task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         log.info("👋 Усі асинхронні задачі успішно закриті. Бувай!")
 

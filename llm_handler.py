@@ -29,8 +29,8 @@ class LLMHandler:
                 self.model = Llama(
                     model_path=model_path,
                     n_ctx=self.llm_config.get('n_ctx', 512),
-                    n_threads=self.llm_config.get('n_threads', 4),
-                    n_threads_batch=self.llm_config.get('n_threads_batch', 4),
+                    n_threads=self.llm_config.get('n_threads', 2),
+                    n_threads_batch=self.llm_config.get('n_threads_batch', 2),
                     n_batch=self.llm_config.get('n_batch', 32),
                     f16_kv=True,
                     use_mmap=True,
@@ -50,11 +50,14 @@ class LLMHandler:
         text = re.sub(r'\[.*?\]', '', text)
         text = re.sub(r'\b(пф|хм|оу|хаха|ахах|хехе|ее|е\-е)\b', '', text, flags=re.IGNORECASE)
 
-        # Замінюємо довгі тире на коми, щоб уникнути заїкань в StyleTTS2
+        # Виправлення злиплих слів від моделі
+        text = re.sub(r'(привіт)(привіт)', r'\1 \2', text, flags=re.IGNORECASE)
+        text = re.sub(r'(топ)(п\'ять|пять)', r'\1 \2', text, flags=re.IGNORECASE)
+
+        # Замінюємо довгі тире на коми для кращої інтонації
         text = text.replace('—', ',').replace(' – ', ', ').replace(' - ', ', ')
         text = text.replace('’', "'").replace('`', "'")
 
-        # Дозволяємо лише базові розділові знаки та апостроф
         text = re.sub(r'[^\w\s.,!?:\u0027іІїЇєЄґҐ]', '', text)
         text = self._replace_numbers_with_words(text)
         text = re.sub(r'\s+', ' ', text)
@@ -100,11 +103,15 @@ class LLMHandler:
             token_buffer += token
 
             should_split = False
-            if re.search(r'[.!?\n]', token_buffer) and (
-                    token_buffer.endswith(' ') or re.search(r'[.!?\n]\s*$', token_buffer)):
-                should_split = True
-                # Зменшили поріг з 45 до 38 символів для швидшого стрімінгу шматків тексту через кому
-            elif len(token_buffer) > 38 and ',' in token_buffer and (
+
+            # Захист від списків типу "один. два."
+            is_list_pattern = re.search(r'\b(один|два|три|чотири|п\'ять|пять|шосте|сьоме)\.\s*$', token_buffer,
+                                        flags=re.IGNORECASE)
+
+            if re.search(r'[.!?\n]', token_buffer) and not is_list_pattern:
+                if token_buffer.endswith(' ') or re.search(r'[.!?\n]\s*$', token_buffer):
+                    should_split = True
+            elif len(token_buffer) > 45 and ',' in token_buffer and (
                     token_buffer.endswith(' ') or token_buffer.endswith(',')):
                 should_split = True
 
@@ -112,7 +119,8 @@ class LLMHandler:
                 clean_sentence = self._clean_text_for_tts(token_buffer)
                 clean_sentence = re.sub(r'^[.,!?—\-:\s]+', '', clean_sentence).strip()
 
-                if len(clean_sentence) >= 5:
+                # Відсікаємо занадто дрібні обрубки тексту
+                if len(clean_sentence) >= 12:
                     current_time = time.time()
                     gen_delta = current_time - last_sentence_time
                     last_sentence_time = current_time
@@ -121,7 +129,6 @@ class LLMHandler:
                     full_response += " " + clean_sentence
                     token_buffer = ""
 
-                    # Фінальний хвіст
         if token_buffer.strip() and not (interrupt_event and interrupt_event.is_set()):
             clean_sentence = self._clean_text_for_tts(token_buffer)
             clean_sentence = re.sub(r'^[.,!?—\-:\s]+', '', clean_sentence).strip()
@@ -129,7 +136,7 @@ class LLMHandler:
             if not any(clean_sentence.endswith(char) for char in ['.', '!', '?', ',']):
                 clean_sentence = re.sub(r'\s+\w+$', '', clean_sentence).strip()
 
-            if len(clean_sentence) >= 3:
+            if len(clean_sentence) >= 4:
                 current_time = time.time()
                 gen_delta = current_time - last_sentence_time
                 yield clean_sentence, gen_delta
