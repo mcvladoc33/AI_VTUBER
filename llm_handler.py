@@ -1,5 +1,4 @@
 import os
-import sys
 import re
 import time
 from llama_cpp import Llama
@@ -11,6 +10,9 @@ class LLMHandler:
     def __init__(self, config):
         self.llm_config = config.get('llm', {})
         self.char_config = config.get('character', {})
+        # Параметр для гнучкого налаштування довжини буфера
+        self.min_sentence_len = self.llm_config.get('min_sentence_len', 12)
+
         self.history = []
         self.max_history_turns = 4
 
@@ -19,45 +21,40 @@ class LLMHandler:
             log.critical(f"❌ [LLM] Файл моделі не знайдено: {model_path}")
             self.model = None
             return
-        log.info(f"🧠 [LLM] Ініціалізація GGUF моделі з кешуванням...")
 
-        old_stdout, old_stderr = os.dup(1), os.dup(2)
+        log.info(f"🧠 [LLM] Ініціалізація GGUF моделі...")
+
+        null_fd = os.open(os.devnull, os.O_WRONLY)
+        save_stderr = os.dup(2)
+        os.dup2(null_fd, 2)
+
         try:
-            with open(os.devnull, 'w') as devnull:
-                os.dup2(devnull.fileno(), 1)
-                os.dup2(devnull.fileno(), 2)
-                self.model = Llama(
-                    model_path=model_path,
-                    n_ctx=self.llm_config.get('n_ctx', 512),
-                    n_threads=self.llm_config.get('n_threads', 2),
-                    n_threads_batch=self.llm_config.get('n_threads_batch', 2),
-                    n_batch=self.llm_config.get('n_batch', 32),
-                    f16_kv=True,
-                    use_mmap=True,
-                    embedding=False,
-                    verbose=False
-                )
+            self.model = Llama(
+                model_path=model_path,
+                n_ctx=self.llm_config.get('n_ctx', 512),
+                n_threads=self.llm_config.get('n_threads', 4),
+                n_threads_batch=self.llm_config.get('n_threads_batch', 4),
+                n_batch=self.llm_config.get('n_batch', 64),
+                f16_kv=True,
+                use_mmap=True,
+                embedding=False,
+                verbose=False
+            )
         finally:
-            os.dup2(old_stdout, 1)
-            os.dup2(old_stderr, 2)
-            os.close(old_stdout)
-            os.close(old_stderr)
+            os.dup2(save_stderr, 2)
+            os.close(save_stderr)
+            os.close(null_fd)
 
-        log.info("✅ [LLM] Модель інтегрована (Кеш та відображення пам'яті активні).")
+        log.info("✅ [LLM] Модель інтегрована.")
 
     def _clean_text_for_tts(self, text: str) -> str:
         text = re.sub(r'\(.*?\)', '', text)
         text = re.sub(r'\[.*?\]', '', text)
         text = re.sub(r'\b(пф|хм|оу|хаха|ахах|хехе|ее|е\-е)\b', '', text, flags=re.IGNORECASE)
-
-        # Виправлення злиплих слів від моделі
         text = re.sub(r'(привіт)(привіт)', r'\1 \2', text, flags=re.IGNORECASE)
         text = re.sub(r'(топ)(п\'ять|пять)', r'\1 \2', text, flags=re.IGNORECASE)
-
-        # Замінюємо довгі тире на коми для кращої інтонації
         text = text.replace('—', ',').replace(' – ', ', ').replace(' - ', ', ')
         text = text.replace('’', "'").replace('`', "'")
-
         text = re.sub(r'[^\w\s.,!?:\u0027іІїЇєЄґҐ]', '', text)
         text = self._replace_numbers_with_words(text)
         text = re.sub(r'\s+', ' ', text)
@@ -74,7 +71,6 @@ class LLMHandler:
 
     def generate_response(self, text: str, interrupt_event=None):
         if not self.model: return
-
         self.history.append({"role": "user", "text": text})
 
         prompt = f"System: {self.char_config.get('system_prompt', '')}\n"
@@ -85,8 +81,8 @@ class LLMHandler:
         response_stream = self.model(
             prompt=prompt,
             max_tokens=self.llm_config.get('max_tokens', 400),
-            temperature=self.llm_config.get('temperature', 0.6),
-            repeat_penalty=self.llm_config.get('repeat_penalty', 1.2),
+            temperature=0.6,
+            repeat_penalty=1.1,
             stop=["User:", "System:", "Assistant:", "\nUser"],
             stream=True
         )
@@ -96,15 +92,11 @@ class LLMHandler:
         last_sentence_time = time.time()
 
         for chunk in response_stream:
-            if interrupt_event and interrupt_event.is_set():
-                break
-
+            if interrupt_event and interrupt_event.is_set(): break
             token = chunk["choices"][0]["text"]
             token_buffer += token
 
             should_split = False
-
-            # Захист від списків типу "один. два."
             is_list_pattern = re.search(r'\b(один|два|три|чотири|п\'ять|пять|шосте|сьоме)\.\s*$', token_buffer,
                                         flags=re.IGNORECASE)
 
@@ -118,13 +110,10 @@ class LLMHandler:
             if should_split:
                 clean_sentence = self._clean_text_for_tts(token_buffer)
                 clean_sentence = re.sub(r'^[.,!?—\-:\s]+', '', clean_sentence).strip()
-
-                # Відсікаємо занадто дрібні обрубки тексту
-                if len(clean_sentence) >= 12:
-                    current_time = time.time()
-                    gen_delta = current_time - last_sentence_time
-                    last_sentence_time = current_time
-
+                # Використання динамічного значення з конфігу
+                if len(clean_sentence) >= self.min_sentence_len:
+                    gen_delta = time.time() - last_sentence_time
+                    last_sentence_time = time.time()
                     yield clean_sentence, gen_delta
                     full_response += " " + clean_sentence
                     token_buffer = ""
@@ -132,18 +121,12 @@ class LLMHandler:
         if token_buffer.strip() and not (interrupt_event and interrupt_event.is_set()):
             clean_sentence = self._clean_text_for_tts(token_buffer)
             clean_sentence = re.sub(r'^[.,!?—\-:\s]+', '', clean_sentence).strip()
-
             if not any(clean_sentence.endswith(char) for char in ['.', '!', '?', ',']):
                 clean_sentence = re.sub(r'\s+\w+$', '', clean_sentence).strip()
-
             if len(clean_sentence) >= 4:
-                current_time = time.time()
-                gen_delta = current_time - last_sentence_time
-                yield clean_sentence, gen_delta
+                yield clean_sentence, time.time() - last_sentence_time
                 full_response += " " + clean_sentence
 
-        if full_response.strip():
-            self.history.append({"role": "assistant", "text": full_response.strip()})
-
+        self.history.append({"role": "assistant", "text": full_response.strip()})
         if len(self.history) > self.max_history_turns:
             self.history = self.history[-self.max_history_turns:]

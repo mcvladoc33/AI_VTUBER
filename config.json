@@ -7,12 +7,13 @@
   "llm": {
     "model_path": "models/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf",
     "n_ctx": 512,
-    "max_tokens": 400,
+    "max_tokens": 500,
     "temperature": 0.6,
     "repeat_penalty": 1.1,
     "n_threads": 4,
     "n_threads_batch": 4,
-    "n_batch": 64
+    "n_batch": 64,
+    "min_sentence_len": 6
   },
   "tts": {
     "engine": "onnx",
