@@ -1,6 +1,7 @@
 import os
 import sys
 import re
+import time  # Використовується для заміру кожної репліки
 from llama_cpp import Llama
 from logger_config import log
 from num2words import num2words
@@ -18,8 +19,7 @@ class LLMHandler:
             log.critical(f"❌ [LLM] Файл моделі не знайдено: {model_path}")
             self.model = None
             return
-
-        log.info(f"🧠 [LLM] Ініціалізація GGUF моделі...")
+        log.info(f"🧠 [LLM] Ініціалізація GGUF моделі з кешуванням...")
 
         old_stdout, old_stderr = os.dup(1), os.dup(2)
         try:
@@ -28,11 +28,13 @@ class LLMHandler:
                 os.dup2(devnull.fileno(), 2)
                 self.model = Llama(
                     model_path=model_path,
-                    n_ctx=self.llm_config.get('n_ctx', 2048),
-                    n_threads=self.llm_config.get('n_threads', 4),
-                    n_threads_batch=self.llm_config.get('n_threads_batch', 4),
-                    n_batch=self.llm_config.get('n_batch', 32),
+                    n_ctx=self.llm_config.get('n_ctx', 1024),
+                    n_threads=self.llm_config.get('n_threads', 3),
+                    n_threads_batch=self.llm_config.get('n_threads_batch', 3),
+                    n_batch=self.llm_config.get('n_batch', 256),
                     f16_kv=True,
+                    use_mmap=True,
+                    embedding=False,
                     verbose=False
                 )
         finally:
@@ -41,20 +43,14 @@ class LLMHandler:
             os.close(old_stdout)
             os.close(old_stderr)
 
-        log.info("✅ [LLM] Модель інтегрована (KV-кеш стабільний).")
+        log.info("✅ [LLM] Модель інтегрована (Кеш та відображення пам'яті активні).")
 
     def _clean_text_for_tts(self, text: str) -> str:
-        """ Очищення тексту для StyleTTS2 """
         text = re.sub(r'\(.*?\)', '', text)
         text = re.sub(r'\[.*?\]', '', text)
-
-        # Видаляємо звукові паразити
         text = re.sub(r'\b(пф|хм|оу|хаха|ахах|хехе|ее|е\-е)\b', '', text, flags=re.IGNORECASE)
-
-        # Тільки українські літери, цифри та пунктуація
         text = re.sub(r'[^\w\s.,!?—\-:;іІїЇєЄґҐ\']', '', text)
         text = self._replace_numbers_with_words(text)
-
         text = re.sub(r'\s+', ' ', text)
         return text.strip()
 
@@ -80,14 +76,17 @@ class LLMHandler:
         response_stream = self.model(
             prompt=prompt,
             max_tokens=self.llm_config.get('max_tokens', 250),
-            temperature=self.llm_config.get('temperature', 0.7),
-            repeat_penalty=self.llm_config.get('repeat_penalty', 1.15),
+            temperature=self.llm_config.get('temperature', 0.6),
+            repeat_penalty=self.llm_config.get('repeat_penalty', 1.2),
             stop=["User:", "System:", "Assistant:", "\nUser"],
             stream=True
         )
 
         full_response = ""
         token_buffer = ""
+
+        # Засікаємо початкову точку відліку для першого речення
+        last_sentence_time = time.time()
 
         for chunk in response_stream:
             if interrupt_event and interrupt_event.is_set():
@@ -96,27 +95,30 @@ class LLMHandler:
             token = chunk["choices"][0]["text"]
             token_buffer += token
 
-            # Перевіряємо закінчення речення (. ! ? або новий рядок)
             if re.search(r'[.!?\n]', token_buffer):
-                # Захист від розриву слів: віддаємо, тільки якщо слово завершене пробілом
                 if token_buffer.endswith(' ') or re.search(r'[.!?\n]\s*$', token_buffer):
                     clean_sentence = self._clean_text_for_tts(token_buffer)
+                    if len(clean_sentence) >= 12:
+                        # Рахуємо, скільки часу пішло на генерацію конкретно цієї репліки
+                        current_time = time.time()
+                        gen_delta = current_time - last_sentence_time
+                        last_sentence_time = current_time  # оновлюємо таймер для наступного речення
 
-                    # ГРУПУВАННЯ: Якщо назбиралося менше 35 символів (поодинокі слова),
-                    # ми НЕ віддаємо їх в TTS, а чекаємо наступного токена для склеювання.
-                    if len(clean_sentence) >= 20:
-                        yield clean_sentence
+                        # Повертаємо кортеж: (текст_речення, час_генерації)
+                        yield clean_sentence, gen_delta
                         full_response += " " + clean_sentence
                         token_buffer = ""
 
-        # Вигрібаємо залишки тексту (включаючи поодинокі слова наприкінці репліки)
         if token_buffer.strip() and not (interrupt_event and interrupt_event.is_set()):
             clean_sentence = self._clean_text_for_tts(token_buffer)
             if len(clean_sentence) >= 2:
-                yield clean_sentence
+                current_time = time.time()
+                gen_delta = current_time - last_sentence_time
+                yield clean_sentence, gen_delta
                 full_response += " " + clean_sentence
 
         if full_response.strip():
             self.history.append({"role": "assistant", "text": full_response.strip()})
+
         if len(self.history) > self.max_history_turns:
             self.history = self.history[-self.max_history_turns:]

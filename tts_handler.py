@@ -4,7 +4,7 @@ import warnings
 import torch
 import numpy as np
 
-torch.set_num_interop_threads(1)
+# ПРИБРАНО ЖОРСТКЕ ОБМЕЖЕННЯ ІНТЕР-ПОТОКІВ ЗВІДСИ
 
 import sounddevice as sd
 import threading
@@ -62,8 +62,10 @@ class TTSHandler:
         self.config = config
         self.tts_config = config.get('tts', {})
 
-        tts_threads = self.tts_config.get("n_threads", 3)  # 3 за замовчуванням
+        # Оптимізація потоків для PyTorch
+        tts_threads = self.tts_config.get("n_threads", 4)
         torch.set_num_threads(tts_threads)
+        torch.set_num_interop_threads(2)  # Дозволяємо паралелити внутрішні математичні операції
 
         self.text_queue = queue.Queue()
         self.audio_queue = queue.Queue()
@@ -153,7 +155,6 @@ class TTSHandler:
                 self._is_playing_now = True
                 sd.play(audio_data, 24000)
 
-                # Повертаємо класичний, стабільний контроль потоку
                 while not self.interrupted:
                     try:
                         if not sd.get_stream().active:
@@ -191,12 +192,14 @@ class TTSHandler:
             pass
         while not self.text_queue.empty():
             try:
-                self.text_queue.get_nowait(); self.text_queue.task_done()
+                self.text_queue.get_nowait();
+                self.text_queue.task_done()
             except queue.Empty:
                 break
         while not self.audio_queue.empty():
             try:
-                self.audio_queue.get_nowait(); self.audio_queue.task_done()
+                self.audio_queue.get_nowait();
+                self.audio_queue.task_done()
             except queue.Empty:
                 break
         self._is_playing_now = False
