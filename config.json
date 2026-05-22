@@ -5,9 +5,9 @@
     "compute_type": "int8"
   },
   "llm": {
-    "model_path": "models/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf",
-    "n_ctx": 512,
-    "max_tokens": 500,
+    "model_path": "models/Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf",
+    "n_ctx": 1024,
+    "max_tokens": 600,
     "temperature": 0.6,
     "repeat_penalty": 1.1,
     "n_threads": 4,
