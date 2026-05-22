@@ -15,7 +15,14 @@ class TTSHandler:
     def __init__(self, config):
         self.tts_config = config.get('tts', {})
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.engine = ONNXEngine(os.path.join(os.getcwd(), self.tts_config.get("onnx_path", "")), 4)
+
+        # Динамічно беремо кількість потоків із конфігу (за замовчуванням 4)
+        n_threads = self.tts_config.get("n_threads", 4)
+        onnx_full_path = os.path.join(os.getcwd(), self.tts_config.get("onnx_path", "models/styletts2.onnx"))
+
+        # Ініціалізуємо наш новий прискорений C++ двигун
+        self.engine = ONNXEngine(onnx_full_path, n_threads=n_threads)
+
         self.tokenizer = StyleTTS2Tokenizer(
             hf_path=os.path.join(os.getcwd(), "models", "styletts2_ukrainian_multispeaker"))
         self.stressify = Stressifier()
@@ -27,8 +34,17 @@ class TTSHandler:
     def _load_preset(self):
         path = os.path.join("voices", self.tts_config.get("preset_filename", "Інна Гелевера.pt"))
         if os.path.exists(path):
-            self.style = torch.load(path, map_location=self.device)
-            log.info(f"✅ [TTS] Пресет голосу успішно завантажено: {path}")
+            # Завантажуємо ваги голосу
+            loaded_style = torch.load(path, map_location='cpu')
+
+            # Для ONNX вигідніше відразу перевести тензор у чистий NumPy масив,
+            # щоб не витрачати час на конвертацію під час кожної швидкої репліки
+            if hasattr(loaded_style, 'detach'):
+                self.style = loaded_style.detach().cpu().numpy()
+            else:
+                self.style = loaded_style
+
+            log.info(f"✅ [TTS] Пресет голосу успішно завантажено та конвертовано для ONNX: {path}")
         else:
             log.warning(f"⚠️ [TTS] Файл пресету голосу не знайдено за шляхом: {path}")
 
@@ -44,8 +60,11 @@ class TTSHandler:
             phonemes = ipa(stressed)
             tokens = self.tokenizer.encode(phonemes)
 
-            # 2. Генерація звукової хвилі
-            wav = self.engine.generate(tokens, 1.15, self.style)
+            # Беремо швидкість із файлу конфігурації (у тебе там 1.15)
+            speed = self.tts_config.get("speed", 1.15)
+
+            # 2. Генерація звукової хвилі через оптимізований ONNXEngine
+            wav = self.engine.generate(tokens, speed, self.style)
 
             if wav is not None and not self._interrupted:
                 audio_data = wav.astype(np.float32)
