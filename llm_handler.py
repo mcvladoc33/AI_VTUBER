@@ -7,17 +7,32 @@ from llama_cpp import Llama
 
 class LLMHandler:
     def __init__(self, config):
-        # Робимо шматочки ще меншими, щоб розвантажити слабкий CPU
-        self.max_words_per_chunk = 4
-        model_path = config.get('llm', {}).get('model_path', '')
+        # Отримуємо секції з конфігу
+        self.llm_config = config.get('llm', {})
+        self.char_config = config.get('character', {})
+
+        # Динамічно підтягуємо ліміт слів для нарізки чанків з min_sentence_len конфігу
+        self.max_words_per_chunk = self.llm_config.get('min_sentence_len', 4)
+
+        # Шлях до моделі
+        model_path = self.llm_config.get('model_path', '')
+
+        # Завантажуємо системний промпт характеру Селті
+        self.system_prompt = self.char_config.get(
+            'system_prompt',
+            "Ти Селті, харизматична дівчина-стрімер. Спілкуйся живою українською мовою."
+        )
 
         old_stderr = sys.stderr
         sys.stderr = open(os.devnull, 'w')
         try:
+            # Ініціалізуємо модель з параметрами з config.json
             self.model = Llama(
                 model_path=model_path,
-                n_ctx=512,
-                n_threads=4,
+                n_ctx=self.llm_config.get('n_ctx', 512),
+                n_threads=self.llm_config.get('n_threads', 4),
+                n_threads_batch=self.llm_config.get('n_threads_batch', 4),
+                n_batch=self.llm_config.get('n_batch', 64),
                 verbose=False
             )
         finally:
@@ -33,19 +48,23 @@ class LLMHandler:
         return re.sub(r'\s+', ' ', re.sub(r'[^\w\s.,!?:\u0027іІїЇєЄґҐ-]', '', text)).strip()
 
     def generate_response(self, text, interrupt_event=None):
+        # Додаємо в промпт інструкцію про "стиль стрімера"
         prompt = (
-            f"System: Ти Селті, дівчина-стрімер. Говори від жіночого роду. "
-            f"Спілкуйся живою українською мовою. "
-            f"Пиши дуже просто, без складних зворотів, без цифр і без списків.\n"
+            f"System: {self.system_prompt} "
+            f"Твій стиль мовлення: дружній, впевнений, як у ведучої стріму. "
+            f"Використовуй влучні порівняння та логічні зв'язки (наприклад: 'це важливо, тому що', 'цікавий момент у тому, що'). "
+            f"Будь конкретною, уникай води.\n"
             f"User: {text}\n"
             f"Assistant:"
         )
 
+        # Стрімінг токенів з використанням гнучких параметрів конфігу
         stream = self.model(
             prompt=prompt,
             stream=True,
-            max_tokens=150,  # Обмежуємо загальну довжину відповіді, щоб не перевантажувати чергу
-            temperature=0.5,  # Менша температура — швидша та чіткіша генерація токенів
+            max_tokens=self.llm_config.get('max_tokens', 150),
+            temperature=self.llm_config.get('temperature', 0.5),
+            repeat_penalty=self.llm_config.get('repeat_penalty', 1.1),
             stop=["User:", "<|im_end|>"]
         )
 
@@ -63,7 +82,7 @@ class LLMHandler:
 
             words_count = len(buffer.split())
 
-            # Стріляємо миттєво, як тільки є хоча б 4 слова та будь-який роздільник/пробіл
+            # Спрацьовує, як тільки набрали ліміт слів із конфігу та знайшли роздільник
             if words_count >= self.max_words_per_chunk and (any(m in token for m in split_markers) or token.isspace()):
                 if not re.search(r'\b(ст|ч|л|мл|г|кг|хв|шт)\.$', buffer.strip(), re.IGNORECASE):
                     clean_chunk = self._clean(buffer)

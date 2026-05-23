@@ -1,75 +1,73 @@
 import os
-import sys
-import torch
 import numpy as np
 import onnxruntime as ort
-
-class TorchEngine:
-    def __init__(self, model):
-        self.model = model
-
-    def generate(self, tokens, speed, style):
-        # Стандартний PyTorch інференс
-        return self.model(tokens, speed=speed, s_prev=style).cpu().numpy().flatten()
 
 
 class ONNXEngine:
     def __init__(self, onnx_path, n_threads=4):
+        """
+        Ініціалізує двигун ONNX з оптимізаціями для CPU (Intel i5-8265U).
+        """
         if not os.path.exists(onnx_path):
-            raise FileNotFoundError(f"Критична помилка: ONNX модель не знайдена за шляхом {onnx_path}")
+            raise FileNotFoundError(f"Модель не знайдена: {onnx_path}")
 
-        options = ort.SessionOptions()
-        options.intra_op_num_threads = n_threads
-        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        # Налаштування сесії ONNX для CPU
+        sess_options = ort.SessionOptions()
 
-        # Ініціалізуємо швидку сесію для процесора
+        # 4 потоки для i5-8265U - оптимальний баланс, що запобігає перегріву (тротлінгу)
+        sess_options.intra_op_num_threads = n_threads
+
+        # Послідовне виконання - найкращий вибір для малих тензорів StyleTTS2
+        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+
+        # Увімкнення всіх оптимізацій графа (Graph Fusion, Constant Folding)
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+        # Оптимізації пам'яті для стабільності роботи
+        sess_options.enable_cpu_mem_arena = True
+        sess_options.enable_mem_pattern = True
+
+        # Вимкнення зайвих логів для економії часу
+        sess_options.log_severity_level = 3
+
+        # Ініціалізація сесії
         self.session = ort.InferenceSession(
             onnx_path,
-            sess_options=options,
+            sess_options=sess_options,
             providers=['CPUExecutionProvider']
         )
-        self.input_names = [i.name for i in self.session.get_inputs()]
 
     def generate(self, tokens, speed, style):
-        # Безпечне від'єднання від графа обчислень (виправлення помилок grad)
-        if hasattr(tokens, 'detach'):
-            tokens_np = tokens.detach().cpu().numpy()
-        else:
-            tokens_np = tokens
-
-        # Додаємо технічний нуль на початок масиву фонем/токенів
+        """
+        Генерує аудіо з фонем та стилю.
+        """
+        # 1. Підготовка токенів: конвертація в numpy та додавання технічного нуля
+        tokens_np = tokens.detach().cpu().numpy() if hasattr(tokens, 'detach') else tokens
         tokens_onnx = np.concatenate([[0], tokens_np]).astype(np.int64)
 
-        # СУВОРЕ ВИПРАВЛЕННЯ: Залишаємо ОДНОМІРНИЙ масив (Expected: 1) відповідно до вимог твоєї моделі
-
-        # Обробка пресету стилю (перетворення з Torch-тензора у Numpy)
+        # 2. Підготовка стилю: переконаємося, що це float32 і розмірність [1, N]
         style_np = style.detach().cpu().numpy() if hasattr(style, 'detach') else style
-        if len(style_np.shape) == 1:
+        if style_np.ndim == 1:
             style_np = np.expand_dims(style_np, axis=0)
 
-        # Формуємо вхідні тензори ТІЛЬКИ в одновимірному форматі для tokens та speed
+        # 3. Формування вхідних даних для ONNX
         inputs = {
             'tokens': tokens_onnx,
-            'speed': np.array(speed, dtype=np.float32),  # Чистий скаляр у форматі numpy без батч-вимірності
+            'speed': np.array(speed, dtype=np.float32),
             's_prev': style_np.astype(np.float32)
         }
 
-        # Виконуємо оптимізований С++ інференс та повертаємо одномірний аудіо-масив
+        # 4. Виконання інференсу
+        # run повертає список результатів, ми беремо перший (аудіо-хвиля)
         return self.session.run(None, inputs)[0].flatten()
 
 
-def get_tts_engine(config_tts, pytorch_model=None):
+# --- Фабричний метод для інтеграції ---
+def get_tts_engine(config_tts):
     """
-    Фабричний метод для автоматичного створення потрібного двигуна
-    на основі файлу конфігурації config.json
+    Фабрика для отримання екземпляра двигуна.
+    Тепер за замовчуванням беремо спрощену модель без квантування.
     """
-    engine_type = config_tts.get("engine", "torch").lower()
-
-    if engine_type == "onnx":
-        onnx_path = config_tts.get("onnx_path", "models/styletts2.onnx")
-        n_threads = config_tts.get("n_threads", 4)
-        return ONNXEngine(onnx_path=onnx_path, n_threads=n_threads)
-    else:
-        if pytorch_model is None:
-            raise ValueError("Для використання TorchEngine необхідно передати завантажену модель PyTorch.")
-        return TorchEngine(pytorch_model)
+    onnx_path = config_tts.get("onnx_path", "models/styletts2_sim.onnx")
+    n_threads = config_tts.get("n_threads", 4)
+    return ONNXEngine(onnx_path=onnx_path, n_threads=n_threads)

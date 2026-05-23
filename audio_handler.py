@@ -1,12 +1,12 @@
 import os
+import re
 from faster_whisper import WhisperModel
 from logger_config import log
-
 
 class AudioHandler:
     def __init__(self, config):
         stt_config = config.get('stt', {})
-        model_size = stt_config.get('model_size', 'base')
+        model_size = stt_config.get('model_size', 'small')
         device = stt_config.get('device', 'cpu')
         compute_type = stt_config.get('compute_type', 'int8')
 
@@ -17,44 +17,38 @@ class AudioHandler:
             device=device,
             compute_type=compute_type
         )
-        log.info("✅ [STT] Whisper успішно ініціалізовано та готовий до роботи.")
+        log.info("✅ [STT] Whisper успішно ініціалізовано.")
 
     def transcribe_audio(self, audio_path: str) -> str:
         if not os.path.exists(audio_path):
             return ""
 
-        technical_prompt = "Розмовна українська мова, чіткі репліки без галюцинацій."
+        try:
+            # Повертаємо перевірені параметри, які працювали стабільно
+            segments, info = self.model.transcribe(
+                audio_path,
+                language="uk",
+                beam_size=1,
+                vad_filter=True,
+                # Стандартні, надійні параметри VAD для Whisper
+                vad_parameters=dict(
+                    threshold=0.5,
+                    min_speech_duration_ms=250,
+                    min_silence_duration_ms=500
+                ),
+                temperature=0.0
+            )
 
-        segments, info = self.model.transcribe(
-            audio_path,
-            language="uk",
-            condition_on_previous_text=False,
-            beam_size=5,
-            best_of=5,
-            temperature=0.0,
-            initial_prompt=technical_prompt,
-            no_speech_threshold=0.6,
-            compression_ratio_threshold=2.4
-        )
+            text = " ".join([segment.text for segment in segments]).strip()
+            text = re.sub(r'\s+', ' ', text)
 
-        text = "".join([segment.text for segment in segments]).strip()
-        text = text.replace(" ?", "?").replace(" !", "!").replace(" .", ".")
+            # Базова фільтрація сміття
+            ignore_list = ["розмовна українська мова", "чіткі репліки", "без галюцинацій"]
+            if len(text) < 3 or any(phrase in text.lower() for phrase in ignore_list):
+                return ""
 
-        hallucination_blacklist = [
-            "дякую за перегляд",
-            "продовження випливає",
-            "субтитри",
-            "редактор",
-            "підписуйтесь",
-            "бувай",
-            "що там як справи",
-            "що там як справи розкажи",
-            "розмовна українська мова"
-        ]
+            return text
 
-        clean_check = text.lower().strip().replace(".", "").replace("!", "").replace("?", "").replace(",", "")
-
-        if len(clean_check) <= 2 or clean_check in hallucination_blacklist:
+        except Exception as e:
+            log.error(f"❌ Помилка розпізнавання: {e}")
             return ""
-
-        return text
