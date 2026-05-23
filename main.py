@@ -1,6 +1,14 @@
 import os
 import sys
 import warnings
+
+# --- ЯДЕРНЕ ПРИДУШЕННЯ (прибирає сміття від llama.cpp/torch при старті) ---
+class SilenceStream:
+    def write(self, *args, **kwargs): pass
+    def flush(self): pass
+_original_stdout, _original_stderr = sys.stdout, sys.stderr
+sys.stdout = sys.stderr = SilenceStream()
+
 import builtins
 import asyncio
 import json
@@ -10,37 +18,28 @@ import soundfile as sf
 import psutil
 import time as t
 
-# --- 1. ТОТАЛЬНЕ ПРИДУШЕННЯ ВАРНІНГІВ ТА СИСТЕМНИХ ЛОГІВ ---
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", module="torch")
+# --- ПАТЧІ ---
+warnings.filterwarnings("ignore")
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-# --- 2. БРОНЕБІЙНИЙ ПАТЧ КОДУВАННЯ ---
 original_open = builtins.open
-
-
 def robust_utf8_open(file, mode='r', *args, **kwargs):
     if 'b' not in mode: kwargs.setdefault('encoding', 'utf-8')
     return original_open(file, mode, *args, **kwargs)
-
-
 builtins.open = robust_utf8_open
 
-# --- 3. ПАТЧ ДЛЯ STYLETTS2 ТА HUGGINGFACE ---
 import styletts2_inference.models
-
 styletts2_inference.models.open = robust_utf8_open
-
 
 def fake_hf_hub_download(repo_id, filename, **kwargs):
     if os.path.exists(repo_id): return os.path.join(repo_id, filename)
-    from huggingface_hub import hf_hub_download as original_hf_hub_download
-    return original_hf_hub_download(repo_id, filename, **kwargs)
-
-
+    from huggingface_hub import hf_hub_download
+    return hf_hub_download(repo_id, filename, **kwargs)
 styletts2_inference.models.hf_hub_download = fake_hf_hub_download
 
-# --- 4. ІМПОРТ МОДУЛІВ ПРОЄКТУ ---
+# Відновлюємо вивід для власних логів
+sys.stdout, sys.stderr = _original_stdout, _original_stderr
+
 from logger_config import log
 from audio_handler import AudioHandler
 from llm_handler import LLMHandler
@@ -48,23 +47,16 @@ from tts_handler import TTSHandler
 
 CONFIG_PATH = "config.json"
 TEMP_AUDIO_PATH = os.path.join("inputs", "temp_voice.wav")
-STOP_WORDS = ["стоп", "stop", "замовкни"]
-
 stt_to_llm, llm_to_tts = asyncio.Queue(), asyncio.Queue()
 stop_ev, inter_ev = asyncio.Event(), asyncio.Event()
 
-
-# --- 5. ФУНКЦІЯ ЗАПИСУ ---
 def record_microphone_core(filename, sample_rate=16000, threshold=0.035, silence_duration=1.2):
     os.makedirs(os.path.dirname(filename), exist_ok=True)
     chunk_size = 1024
     audio_buffer, is_speaking = [], False
     silence_samples, max_silence_samples = 0, int((silence_duration * sample_rate) / chunk_size)
     pre_record_len, pre_record_buffer, raw_buffer = int((0.4 * sample_rate) / chunk_size), [], []
-
-    def callback(indata, frames, time_info, status):
-        raw_buffer.append(indata.copy())
-
+    def callback(indata, frames, time_info, status): raw_buffer.append(indata.copy())
     with sd.InputStream(samplerate=sample_rate, channels=1, callback=callback, blocksize=chunk_size):
         while not stop_ev.is_set():
             if raw_buffer:
@@ -81,110 +73,50 @@ def record_microphone_core(filename, sample_rate=16000, threshold=0.035, silence
                     audio_buffer.append(current_chunk)
                     silence_samples = silence_samples + 1 if volume_norm < threshold else 0
                     if silence_samples > max_silence_samples: break
-            else:
-                t.sleep(0.01)
-
+            else: t.sleep(0.01)
     if audio_buffer and not stop_ev.is_set():
         sf.write(filename, np.concatenate(audio_buffer, axis=0), sample_rate)
         return True
     return False
 
-
-# --- 6. АСИНХРОННІ ВОРКЕРИ ---
-async def input_stt_worker(text_mode, stt_module, tts_module):
-    log.info("🟢 [Задача 1: Введення/STT] Успішно запущено.")
+async def input_stt_worker(text_mode, stt_module):
     while not stop_ev.is_set():
-        try:
-            if text_mode:
-                user_input = await asyncio.to_thread(lambda: input("👤 Ви: ").strip())
-                if user_input: await stt_to_llm.put(user_input)
-            else:
-                recorded = await asyncio.to_thread(record_microphone_core, TEMP_AUDIO_PATH, 16000, 0.035, 2.2)
-                if recorded and not stop_ev.is_set():
-                    user_input = await asyncio.to_thread(stt_module.transcribe_audio, TEMP_AUDIO_PATH)
-                    if not user_input or len(user_input.strip()) < 2: continue
-                    if any(word in user_input.lower() for word in STOP_WORDS):
-                        inter_ev.set();
-                        tts_module.stop()
-                        while not stt_to_llm.empty(): stt_to_llm.get_nowait()
-                        while not llm_to_tts.empty(): llm_to_tts.get_nowait()
-                        log.info("🛑 [SYSTEM] Діалог перервано.");
-                        continue
-                    log.info(f"👤 Ви: {user_input}");
+        if text_mode:
+            user_input = await asyncio.to_thread(lambda: input("👤 Ви: ").strip())
+            if user_input: await stt_to_llm.put(user_input)
+        else:
+            recorded = await asyncio.to_thread(record_microphone_core, TEMP_AUDIO_PATH)
+            if recorded:
+                user_input = await asyncio.to_thread(stt_module.transcribe_audio, TEMP_AUDIO_PATH)
+                if user_input:
+                    log.info(f"👤 Ви: {user_input}")
                     await stt_to_llm.put(user_input)
-        except Exception as e:
-            log.error(f"❌ STT Error: {e}"); await asyncio.sleep(1)
-
 
 async def llm_worker(llm):
-    log.info("🟢 [Задача 2: Обробка/LLM] Успішно запущено.")
     while not stop_ev.is_set():
-        try:
-            user_input = await stt_to_llm.get()
-            inter_ev.clear()
-            gen = llm.generate_response(user_input, interrupt_event=inter_ev)
-            while True:
-                if inter_ev.is_set() or stop_ev.is_set(): break
-                if llm_to_tts.qsize() >= 1: await asyncio.sleep(0.05); continue
-                res = await asyncio.to_thread(lambda: next(gen, None))
-                if res is None: break
-                text_chunk, gen_time = res
-                log.info(f"  ➔ {text_chunk} [LLM Gen: {gen_time:.2f}s]")
-                await llm_to_tts.put(text_chunk)
-            stt_to_llm.task_done()
-        except Exception as e:
-            log.error(f"❌ LLM Error: {e}"); await asyncio.sleep(1)
-
+        user_input = await stt_to_llm.get()
+        inter_ev.clear()
+        for text_chunk, _ in llm.generate_response(user_input, inter_ev):
+            if inter_ev.is_set(): break
+            await llm_to_tts.put(text_chunk)
+        stt_to_llm.task_done()
 
 async def tts_worker(tts):
-    log.info("🟢 [Задача 3: Конвеєр Синтезу] Успішно запущено.")
     while not stop_ev.is_set():
-        try:
-            sentence = await llm_to_tts.get()
-            if not inter_ev.is_set():
-                start = t.time()
-                await asyncio.to_thread(tts.say, sentence)
-                log.info(f"  🔊 [PIPELINE] Відпрацьовано: {t.time() - start:.4f}s")
-            llm_to_tts.task_done()
-        except Exception as e:
-            log.error(f"❌ TTS Error: {e}"); await asyncio.sleep(1)
+        sentence = await llm_to_tts.get()
+        if not inter_ev.is_set():
+            await asyncio.to_thread(tts.say, sentence)
+        llm_to_tts.task_done()
 
-
-# --- 7. ГОЛОВНА ЛОГІКА З КОРЕКТНИМ ВИХОДОМ ---
 async def main_async():
-    try:
-        psutil.Process(os.getpid()).nice(psutil.HIGH_PRIORITY_CLASS)
-    except:
-        pass
-
-    with open(CONFIG_PATH, "r") as f:
-        cfg = json.load(f)
+    with open(CONFIG_PATH, "r") as f: cfg = json.load(f)
     stt_m = AudioHandler(cfg)
     llm = LLMHandler(cfg)
     tts_m = TTSHandler(cfg)
-
-    tasks = [
-        asyncio.create_task(input_stt_worker(cfg.get('text_mode', False), stt_m, tts_m)),
-        asyncio.create_task(llm_worker(llm)),
-        asyncio.create_task(tts_worker(tts_m))
-    ]
-
+    tasks = [asyncio.create_task(input_stt_worker(cfg.get('text_mode', False), stt_m)),
+             asyncio.create_task(llm_worker(llm)),
+             asyncio.create_task(tts_worker(tts_m))]
     log.info("🚀 [SYSTEM] Роботу конвеєра стабілізовано!")
-    try:
-        await stop_ev.wait()
-    finally:
-        log.info("🧹 Очищення ресурсів...")
-        stop_ev.set()
-        tts_m.stop()
-        for t in tasks: t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        log.info("✅ Система успішно завершила роботу.")
+    await stop_ev.wait()
 
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main_async())
-    except KeyboardInterrupt:
-        pass
-    finally:
-        sys.exit(0)
+if __name__ == "__main__": asyncio.run(main_async())
