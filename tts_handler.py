@@ -120,9 +120,9 @@ class TTSHandler:
 
         try:
             if hasattr(self.multi_model, 'model'):
-                self.multi_model.model.diffusion_steps = 3
+                self.multi_model.model.diffusion_steps = 1
                 if hasattr(self.multi_model.model, 'args'):
-                    self.multi_model.model.args.diffusion_steps = 3
+                    self.multi_model.model.args.diffusion_steps = 1
         except Exception:
             pass
 
