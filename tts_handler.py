@@ -78,6 +78,14 @@ class TTSHandler:
         self.config = config
         self.tts_config = config.get('tts', {})
 
+        # ДОДАНО: обмежуємо кількість потоків PyTorch ДО створення моделі,
+        # інакше StyleTTS2 за замовчуванням хапає всі доступні ядра і
+        # конкурує з LLM-decode за ті самі 4 фізичних ядра
+        tts_threads = self.tts_config.get("n_threads", 2)
+        torch.set_num_threads(tts_threads)
+        torch.set_num_interop_threads(1)
+        print(f"🧵 [TTS] Кількість потоків PyTorch обмежено до {tts_threads}.")
+
         self.text_queue = queue.Queue()
         self.audio_queue = queue.Queue()
 
@@ -101,6 +109,7 @@ class TTSHandler:
         self.use_verbalizer = self.tts_config.get("use_verbalizer", False)
 
         self.is_first_chunk = True
+        self._session_wavs = []
 
         self.verbalizer_model = None
         self.tokenizer = None
@@ -135,6 +144,16 @@ class TTSHandler:
         self.target_duration = None
         self._prepare_voice()
 
+        try:
+            warm = normalize('NFKC', "Привіт")
+            ps = self.ipa_func(self.stressify(warm))
+            if ps:
+                _ = self.multi_model(self.multi_model.tokenizer.encode(ps),
+                                     speed=self.speed, s_prev=self.style.clone())
+            print("✅ [TTS] Прогрів синтезатора завершено.")
+        except Exception as e:
+            print(f"⚠️ [TTS] Прогрів TTS не вдався: {e}")
+
         threading.Thread(target=self._text_processing_worker, daemon=True).start()
         threading.Thread(target=self._audio_playback_worker, daemon=True).start()
 
@@ -164,69 +183,56 @@ class TTSHandler:
             print(f"👤 [TTS] Успішно активовано пресет: {preset_file}")
 
     def _split_to_parts(self, text_data):
-        # ОНОВЛЕНО: Додано розділення за двокрапкою (:) та крапкою з комою (;) на першому рівні з урахуванням лапок
+        MAX_CHARS = 240   # межа одного виклику StyleTTS2
+        SOFT_MIN = 150    # не віддавати дрібноту окремо
+
         sentences = re.split(r'([.!?;:—–])(?=(?:[^"]*"[^"]*")*[^"]*$)(?=(?:[^«]*«[^»]*»)*[^»]*$)', text_data)
-        raw_chunks = []
-        current_sentence = ""
-
-        # Список основних термінальних знаків
-        terminal_punctuations = '.!?;:—–'
-
+        raw, cur = [], ""
         for item in sentences:
             if not item:
                 continue
-            if item in terminal_punctuations:
-                current_sentence += item
-                raw_chunks.append(current_sentence.strip())
-                current_sentence = ""
+            if item in '.!?;:—–':
+                cur += item
+                raw.append(cur.strip())
+                cur = ""
             else:
-                current_sentence += item
-        if current_sentence.strip():
-            raw_chunks.append(current_sentence.strip())
+                cur += item
+        if cur.strip():
+            raw.append(cur.strip())
 
-        final_parts = []
-        for chunk in raw_chunks:
-            if len(chunk) <= 60:
-                final_parts.append(chunk)
+        # ЗЛИТТЯ: склеюємо сусідні речення, поки не впремося в MAX_CHARS
+        merged = []
+        acc = ""
+        for s in raw:
+            if not s:
                 continue
+            if not acc:
+                acc = s
+            elif len(acc) + len(s) + 1 <= MAX_CHARS:
+                acc += " " + s
+            else:
+                merged.append(acc)
+                acc = s
+        if acc:
+            merged.append(acc)
 
-            # Додаткова нарізка за комами, якщо шматок все одно занадто довгий
-            sub_parts = re.split(r'([,])(?=(?:[^"]*"[^"]*")*[^"]*$)(?=(?:[^«]*«[^»]*»)*[^»]*$)', chunk)
-            sub_chunk = ""
-            for sub_item in sub_parts:
-                if not sub_item:
-                    continue
-                if sub_item == ',':
-                    sub_chunk += sub_item
-                    if len(sub_chunk.strip()) > 30:
-                        final_parts.append(sub_chunk.strip())
-                        sub_chunk = ""
+        # Аварійна нарізка тільки для реально довгих блоків без пунктуації
+        final = []
+        for chunk in merged:
+            if len(chunk) <= MAX_CHARS:
+                final.append(chunk)
+                continue
+            words, temp = chunk.split(' '), ""
+            for w in words:
+                if len(temp) + len(w) + 1 > MAX_CHARS and temp:
+                    final.append(temp.strip())
+                    temp = w
                 else:
-                    if sub_chunk and len(sub_chunk) > 50:
-                        final_parts.append(sub_chunk.strip())
-                        sub_chunk = sub_item
-                    else:
-                        sub_chunk += sub_item
-            if sub_chunk.strip():
-                rest = sub_chunk.strip()
-                if len(rest) > 65:
-                    words = rest.split(' ')
-                    temp_phrase = ""
-                    in_quotes = False
-                    for w in words:
-                        if '"' in w or '«' in w or '»' in w:
-                            in_quotes = not in_quotes
-                        if len(temp_phrase) + len(w) + 1 > 55 and not in_quotes:
-                            final_parts.append(temp_phrase.strip())
-                            temp_phrase = w
-                        else:
-                            temp_phrase += " " + w if temp_phrase else w
-                    if temp_phrase.strip():
-                        final_parts.append(temp_phrase.strip())
-                else:
-                    final_parts.append(rest)
+                    temp += " " + w if temp else w
+            if temp.strip():
+                final.append(temp.strip())
 
-        return [p for p in final_parts if p]
+        return [p for p in final if p]
 
     def _text_processing_worker(self):
         while True:
@@ -248,7 +254,6 @@ class TTSHandler:
                     self.text_queue.task_done()
                     continue
 
-                # ОНОВЛЕНО: Спліттер основного циклу тепер враховує двокрапку та крапку з комою як кінець логічного блоку
                 raw_sentences = re.split(r'(?<=[.!?;:])\s+', clean_text)
                 processed_sentences = []
 
@@ -322,42 +327,28 @@ class TTSHandler:
                         self.audio_queue.put(audio_chunk)
 
                 if block_wavs:
-                    combined_block = np.concatenate(block_wavs)
-                    wav_output_path = os.path.join(self.output_dir, "output.wav")
-                    mp3_output_path = os.path.join(self.output_dir, "output.mp3")
-
-                    clipped_audio = np.clip(combined_block, -1.0, 1.0)
-                    int16_audio = (clipped_audio * 32767).astype(np.int16)
-                    new_segment = AudioSegment(
-                        int16_audio.tobytes(),
-                        frame_rate=24000,
-                        sample_width=2,
-                        channels=1
-                    )
-
-                    if self.is_first_chunk:
-                        sf.write(wav_output_path, combined_block, 24000)
-                        new_segment.export(mp3_output_path, format="mp3", bitrate="192k")
-                        self.is_first_chunk = False
-                        print(f"   💾 [SYSTEM] Записано початок монологу в: output.mp3")
-                    else:
-                        try:
-                            existing_segment = AudioSegment.from_mp3(mp3_output_path)
-                            full_monologue = existing_segment + new_segment
-                            full_monologue.export(mp3_output_path, format="mp3", bitrate="192k")
-
-                            y_old, _ = librosa.load(wav_output_path, sr=24000)
-                            full_wav_data = np.concatenate([y_old, combined_block])
-                            sf.write(wav_output_path, full_wav_data, 24000)
-                            print(f"   ➕ [SYSTEM] Фрагмент успішно дошито в кінець: output.mp3")
-                        except Exception:
-                            sf.write(wav_output_path, combined_block, 24000)
-                            new_segment.export(mp3_output_path, format="mp3", bitrate="192k")
+                    self._session_wavs.extend(block_wavs)
 
             except Exception as e:
                 print(f"❌ ПОМИЛКА [TTS]: {e}")
 
             self.text_queue.task_done()
+
+    def flush_session_audio(self):
+        """Кодує монолог один раз, коли CPU вже вільний"""
+        if not self._session_wavs:
+            return
+        try:
+            combined = np.concatenate(self._session_wavs)
+            sf.write(os.path.join(self.output_dir, "output.wav"), combined, 24000)
+            int16 = (np.clip(combined, -1.0, 1.0) * 32767).astype(np.int16)
+            AudioSegment(int16.tobytes(), frame_rate=24000, sample_width=2, channels=1) \
+                .export(os.path.join(self.output_dir, "output.mp3"), format="mp3", bitrate="192k")
+            print("   💾 [SYSTEM] Монолог збережено в output.mp3")
+        except Exception as e:
+            print(f"⚠️ [SYSTEM] Не вдалося зберегти аудіо: {e}")
+        finally:
+            self._session_wavs = []
 
     def _audio_playback_worker(self):
         while True:
@@ -386,3 +377,4 @@ class TTSHandler:
 
     def reset_session(self):
         self.is_first_chunk = True
+        self._session_wavs = []

@@ -16,7 +16,7 @@ CONFIG_PATH = "config.json"
 TEMP_AUDIO_PATH = os.path.join("input", "temp_voice.wav")
 
 
-def record_microphone_clean(filename, sample_rate=16000, threshold=0.05, silence_duration=1.2):
+def record_microphone_clean(filename, sample_rate=16000, threshold=0.05, silence_duration=1.4):
     """Класичний послідовний запис мікрофона без фонових потоків та конфліктів заліза"""
     os.makedirs(os.path.dirname(filename), exist_ok=True)
     chunk_size = 1024
@@ -94,7 +94,7 @@ def main():
                     continue
             else:
                 print("🟢 Очікую ваш голос...")
-                status = record_microphone_clean(TEMP_AUDIO_PATH, threshold=0.05, silence_duration=1.2)
+                status = record_microphone_clean(TEMP_AUDIO_PATH, threshold=0.05, silence_duration=1.6)
 
                 if status == "AUDIO_RECORDED":
                     start_stt = time.time()
@@ -130,6 +130,7 @@ def main():
 
             # Чекаємо, поки Селті повністю договорить речення в плеєрі
             tts_module.wait_until_done()
+            tts_module.flush_session_audio()
             print("\n--------------------------------------------------")
 
         except KeyboardInterrupt:

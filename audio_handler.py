@@ -26,8 +26,12 @@ class AudioHandler:
             audio_path,
             language="uk",
             condition_on_previous_text=False,
-            beam_size=5,
-            best_of=5,  # Шукає найкращий варіант з 5 спроб
+            # beam_size=5,
+            # best_of=5,  # Шукає найкращий варіант з 5 спроб
+            beam_size=1,
+            best_of=1,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=300),
             temperature=0.0,  # Модель максимально "сувора", щоб не вигадувати слова з шуму
             initial_prompt=streamer_prompt,  # Задаємо словниковий орієнтир
             no_speech_threshold=0.6,
