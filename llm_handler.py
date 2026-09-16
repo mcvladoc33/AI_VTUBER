@@ -1,7 +1,9 @@
 import os
-import sys
 import re
+import time
 from llama_cpp import Llama
+from logger_config import log
+
 
 class LLMHandler:
     def __init__(self, config):
@@ -9,23 +11,24 @@ class LLMHandler:
         self.char_config = config.get('character', {})
         self.character_name = self.char_config.get('name', 'Помічниця')
 
-        if not os.path.exists(self.llm_config.get('model_path', '')):
-            print(f"❌ ПОМИЛКА [LLM]: Файл моделі не знайдено: {self.llm_config.get('model_path')}")
+        self.history = []
+        self.max_history_turns = 4
+
+        model_path = self.llm_config.get('model_path', '')
+        if not os.path.exists(model_path):
+            log.critical(f"❌ [LLM] Файл моделі не знайдено: {model_path}")
             self.model = None
             return
 
-        print(f"🧠 [LLM] Завантаження моделі {self.character_name}...")
+        log.info(f"🧠 [LLM] Завантаження моделі {self.character_name}...")
 
-        sys.stdout.flush()
-        old_stdout = os.dup(1)
-        old_stderr = os.dup(2)
+        old_stdout, old_stderr = os.dup(1), os.dup(2)
         try:
             with open(os.devnull, 'w') as devnull:
                 os.dup2(devnull.fileno(), 1)
                 os.dup2(devnull.fileno(), 2)
-
                 self.model = Llama(
-                    model_path=self.llm_config['model_path'],
+                    model_path=model_path,
                     n_ctx=self.llm_config.get('n_ctx', 1024),
                     # n_threads керує decode (генерацією токенів) — тримаємо малим,
                     # щоб лишити ядра для паралельного TTS-рендеру
@@ -44,13 +47,12 @@ class LLMHandler:
             os.close(old_stdout)
             os.close(old_stderr)
 
-        print("✅ [LLM] Модель мислення готова.")
+        log.info("✅ [LLM] Модель мислення готова.")
 
         # Прогрів: проганяємо системний промпт, щоб перша жива репліка
         # не платила за холодний prefill
         try:
-            print("🔥 [LLM] Прогрів моделі...")
-            import time
+            log.info("🔥 [LLM] Прогрів моделі...")
             t0 = time.time()
             self.model(
                 prompt=f"System: {self.char_config.get('system_prompt', '')}\nUser: Привіт\nAssistant:",
@@ -58,43 +60,46 @@ class LLMHandler:
                 stream=False,
                 echo=False
             )
-            print(f"✅ [LLM] Прогрів завершено за {time.time() - t0:.2f}s.")
+            log.info(f"✅ [LLM] Прогрів завершено за {time.time() - t0:.2f}s.")
         except Exception as e:
-            print(f"⚠️ [LLM] Прогрів не вдався (некритично): {e}")
+            log.warning(f"⚠️ [LLM] Прогрів не вдався (некритично): {e}")
 
     def generate_response(self, text: str):
         if not self.model:
             yield "Помилка: Модель ШІ не завантажена."
             return
 
-        prompt = f"System: {self.char_config.get('system_prompt', '')}\nUser: {text}\nAssistant:"
+        self.history.append({"role": "user", "text": text})
+
+        prompt = f"System: {self.char_config.get('system_prompt', '')}\n"
+        for turn in self.history:
+            prompt += f"{'User' if turn['role'] == 'user' else 'Assistant'}: {turn['text']}\n"
+        prompt += "Assistant:"
 
         response_stream = self.model(
             prompt=prompt,
             max_tokens=self.llm_config.get('max_tokens', 180),
             temperature=self.llm_config.get('temperature', 0.65),
+            repeat_penalty=self.llm_config.get('repeat_penalty', 1.15),
             stop=["User:", "System:", "Assistant:", "\nUser"],
             stream=True,
             echo=False
         )
 
         # Гібридна стратегія: перший шматок — маленький (швидкий старт),
-        # решта — великі (економія на оверхеді TTS)
-        FIRST_MIN = 15    # перше речення віддаємо майже одразу
-        NEXT_MIN = 100    # далі накопичуємо
-        NEXT_MAX = 120    # але не більше, щоб StyleTTS2 не деградував
+        # решта — великі (економія на фіксованому оверхеді TTS)
+        FIRST_MIN = 15
+        NEXT_MIN = 100
+        NEXT_MAX = 120
 
         buf = ""
         is_first = True
+        full_response = ""
 
         for chunk in response_stream:
             buf += chunk["choices"][0]["text"]
 
             if is_first:
-                # ВИПРАВЛЕНО: раніше re.search() завжди знаходив найперший
-                # знак пунктуації і намертво "застрягав" на ньому, якщо те
-                # речення виявлялось коротшим за FIRST_MIN. Тепер перебираємо
-                # всі знайдені збіги, поки не знайдемо перший достатньо довгий.
                 found = False
                 for m in re.finditer(r'[.!?…]+(?=\s|$)', buf):
                     candidate = buf[:m.end()].strip()
@@ -102,6 +107,7 @@ class LLMHandler:
                         buf = buf[m.end():]
                         is_first = False
                         found = True
+                        full_response += " " + candidate
                         yield candidate
                         break
                 if found:
@@ -116,6 +122,7 @@ class LLMHandler:
                     part = buf[:end].strip()
                     buf = buf[end:]
                     if part:
+                        full_response += " " + part
                         yield part
                 elif len(buf) >= NEXT_MAX:
                     sp = window.rfind(' ')
@@ -123,7 +130,14 @@ class LLMHandler:
                     part = buf[:sp].strip()
                     buf = buf[sp:]
                     if part:
+                        full_response += " " + part
                         yield part
 
         if buf.strip():
+            full_response += " " + buf.strip()
             yield buf.strip()
+
+        if full_response.strip():
+            self.history.append({"role": "assistant", "text": full_response.strip()})
+        if len(self.history) > self.max_history_turns:
+            self.history = self.history[-self.max_history_turns:]

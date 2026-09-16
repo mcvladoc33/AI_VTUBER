@@ -1,10 +1,11 @@
 import os
-import sys
+import re
+import time
 import warnings
+import threading
+import queue
+from unicodedata import normalize
 
-# =====================================================================
-# 🤫 ПРИДУШЕННЯ ВАРНІНГІВ ТА ЛОГІВ TORCH
-# =====================================================================
 warnings.filterwarnings("ignore", category=UserWarning, message=".*TypedStorage is deprecated.*")
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -15,13 +16,9 @@ os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 import logging
-
 logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("torch").setLevel(logging.ERROR)
 
-# =====================================================================
-# 🛠️ ПАТЧ ДЛЯ FFMPEG
-# =====================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FFMPEG_BIN = os.path.join(BASE_DIR, "bin")
 
@@ -29,26 +26,19 @@ if FFMPEG_BIN not in os.environ["PATH"]:
     os.environ["PATH"] = FFMPEG_BIN + os.path.pathsep + os.environ["PATH"]
 
 from pydub import AudioSegment
-
 AudioSegment.converter = os.path.join(FFMPEG_BIN, "ffmpeg.exe")
 AudioSegment.ffprobe = os.path.join(FFMPEG_BIN, "ffprobe.exe")
-# =====================================================================
 
 import torch
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
 import librosa
-import re
-import threading
-import queue
-import time
-from unicodedata import normalize
 from num2words import num2words
 
+from logger_config import log
 from ipa_uk import ipa
 from ukrainian_word_stress import Stressifier, StressSymbol
-
 import styletts2_inference.models
 
 
@@ -78,13 +68,12 @@ class TTSHandler:
         self.config = config
         self.tts_config = config.get('tts', {})
 
-        # ДОДАНО: обмежуємо кількість потоків PyTorch ДО створення моделі,
-        # інакше StyleTTS2 за замовчуванням хапає всі доступні ядра і
-        # конкурує з LLM-decode за ті самі 4 фізичних ядра
+        # Обмежуємо потоки PyTorch ДО створення моделі — інакше StyleTTS2
+        # хапає всі доступні ядра і конкурує з LLM-decode за той самий бюджет
         tts_threads = self.tts_config.get("n_threads", 2)
         torch.set_num_threads(tts_threads)
         torch.set_num_interop_threads(1)
-        print(f"🧵 [TTS] Кількість потоків PyTorch обмежено до {tts_threads}.")
+        log.info(f"🧵 [TTS] Кількість потоків PyTorch обмежено до {tts_threads}.")
 
         self.text_queue = queue.Queue()
         self.audio_queue = queue.Queue()
@@ -100,11 +89,11 @@ class TTSHandler:
         os.makedirs(self.output_dir, exist_ok=True)
 
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        print(f"📥 [TTS] Ініціалізація StyleTTS2 UA (Робота на: {self.device.upper()})...")
+        log.info(f"📥 [TTS] Ініціалізація StyleTTS2 UA (Робота на: {self.device.upper()})...")
 
         self.mode = self.tts_config.get("mode", "1")
-        self.speed = self.tts_config.get("speed", 1.0)
-        self.noise_scale = self.tts_config.get("noise_scale", 0.1)
+        self.speed = self.tts_config.get("speed", 1.15)
+        self.noise_scale = self.tts_config.get("noise_scale", 0.05)
         self.match_duration = self.tts_config.get("match_duration", False)
         self.use_verbalizer = self.tts_config.get("use_verbalizer", False)
 
@@ -122,9 +111,9 @@ class TTSHandler:
                 ).to(self.device)
                 self.tokenizer.src_lang = "uk_UA"
                 self.tokenizer.tgt_lang = "uk_UA"
-                print("✅ [TTS] Вербалізатор mBART успешно завантажено.")
+                log.info("✅ [TTS] Вербалізатор mBART успішно завантажено.")
             except Exception as e:
-                print(f"⚠️ [TTS] mBART не завантажено ({e}), працює алгоритмічна заміна.")
+                log.warning(f"⚠️ [TTS] mBART не завантажено ({e}), працює алгоритмічна заміна.")
 
         from styletts2_inference.models import StyleTTS2
         self.multi_model = StyleTTS2(hf_path=self.styletts_path, device=self.device)
@@ -134,7 +123,7 @@ class TTSHandler:
                 self.multi_model.model.diffusion_steps = 3
                 if hasattr(self.multi_model.model, 'args'):
                     self.multi_model.model.args.diffusion_steps = 3
-        except:
+        except Exception:
             pass
 
         self.stressify = Stressifier()
@@ -149,10 +138,10 @@ class TTSHandler:
             ps = self.ipa_func(self.stressify(warm))
             if ps:
                 _ = self.multi_model(self.multi_model.tokenizer.encode(ps),
-                                     speed=self.speed, s_prev=self.style.clone())
-            print("✅ [TTS] Прогрів синтезатора завершено.")
+                                      speed=self.speed, s_prev=self.style.clone())
+            log.info("✅ [TTS] Прогрів синтезатора завершено.")
         except Exception as e:
-            print(f"⚠️ [TTS] Прогрів TTS не вдався: {e}")
+            log.warning(f"⚠️ [TTS] Прогрів TTS не вдався: {e}")
 
         threading.Thread(target=self._text_processing_worker, daemon=True).start()
         threading.Thread(target=self._audio_playback_worker, daemon=True).start()
@@ -172,7 +161,7 @@ class TTSHandler:
 
             y, _ = librosa.load(ref_path, sr=24000)
             self.target_duration = librosa.get_duration(y=y, sr=24000)
-            print(f"🎭 [TTS] Клонування голосу з файлу: {ref_file}")
+            log.info(f"🎭 [TTS] Клонування голосу з файлу: {ref_file}")
         else:
             preset_file = self.tts_config.get("preset_filename", "Інна Гелевера.pt")
             preset_path = os.path.join(self.preset_dir, preset_file)
@@ -180,11 +169,10 @@ class TTSHandler:
                 raise FileNotFoundError(f"❌ Пресет '{preset_file}' не знайдено.")
 
             self.style = torch.load(preset_path, map_location=self.device)
-            print(f"👤 [TTS] Успішно активовано пресет: {preset_file}")
+            log.info(f"👤 [TTS] Успішно активовано пресет: {preset_file}")
 
     def _split_to_parts(self, text_data):
-        MAX_CHARS = 240   # межа одного виклику StyleTTS2
-        SOFT_MIN = 150    # не віддавати дрібноту окремо
+        MAX_CHARS = 240
 
         sentences = re.split(r'([.!?;:—–])(?=(?:[^"]*"[^"]*")*[^"]*$)(?=(?:[^«]*«[^»]*»)*[^»]*$)', text_data)
         raw, cur = [], ""
@@ -200,7 +188,6 @@ class TTSHandler:
         if cur.strip():
             raw.append(cur.strip())
 
-        # ЗЛИТТЯ: склеюємо сусідні речення, поки не впремося в MAX_CHARS
         merged = []
         acc = ""
         for s in raw:
@@ -216,7 +203,6 @@ class TTSHandler:
         if acc:
             merged.append(acc)
 
-        # Аварійна нарізка тільки для реально довгих блоків без пунктуації
         final = []
         for chunk in merged:
             if len(chunk) <= MAX_CHARS:
@@ -321,7 +307,7 @@ class TTSHandler:
                         block_wavs.append(audio_chunk)
 
                         part_time = time.time() - part_start
-                        print(
+                        log.info(
                             f"   📢 [StyleTTS2] Шматок {i}/{len(parts)} готовий за {part_time:.3f}s! ({len(t)} симв.) -> {t}")
 
                         self.audio_queue.put(audio_chunk)
@@ -330,12 +316,12 @@ class TTSHandler:
                     self._session_wavs.extend(block_wavs)
 
             except Exception as e:
-                print(f"❌ ПОМИЛКА [TTS]: {e}")
+                log.error(f"❌ ПОМИЛКА [TTS]: {e}")
 
             self.text_queue.task_done()
 
     def flush_session_audio(self):
-        """Кодує монолог один раз, коли CPU вже вільний"""
+        """Кодує монолог один раз, коли CPU вже вільний — не під час генерації."""
         if not self._session_wavs:
             return
         try:
@@ -344,9 +330,9 @@ class TTSHandler:
             int16 = (np.clip(combined, -1.0, 1.0) * 32767).astype(np.int16)
             AudioSegment(int16.tobytes(), frame_rate=24000, sample_width=2, channels=1) \
                 .export(os.path.join(self.output_dir, "output.mp3"), format="mp3", bitrate="192k")
-            print("   💾 [SYSTEM] Монолог збережено в output.mp3")
+            log.info("   💾 [SYSTEM] Монолог збережено в output.mp3")
         except Exception as e:
-            print(f"⚠️ [SYSTEM] Не вдалося зберегти аудіо: {e}")
+            log.warning(f"⚠️ [SYSTEM] Не вдалося зберегти аудіо: {e}")
         finally:
             self._session_wavs = []
 
@@ -359,7 +345,7 @@ class TTSHandler:
                 sd.play(audio_data, 24000)
                 sd.wait()
             except Exception as play_err:
-                print(f"⚠️ [Playback Error]: {play_err}")
+                log.warning(f"⚠️ [Playback Error]: {play_err}")
             finally:
                 self.audio_queue.task_done()
 
