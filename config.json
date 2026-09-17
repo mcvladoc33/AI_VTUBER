@@ -18,7 +18,7 @@
     "engine": "onnx",
     "onnx_model_path": "models/styletts2.onnx",
     "mode": "1",
-    "preset_filename": "Інна Гелевера.pt",
+    "preset_filename": "my_voice.pt",
     "reference_filename": "sample.wav",
     "speed": 1.15,
     "noise_scale": 0.05,
