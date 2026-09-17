@@ -14,6 +14,9 @@ llama-cpp-python>=0.2.50
 # Лінгвістика та ШІ-озвучка голосу (StyleTTS2 UA)
 torch
 torchaudio
+
+# ONNX Runtime — потрібен лише якщо tts.engine="onnx" в config.json
+onnxruntime>=1.17.0
 num2words
 transformers
 sentencepiece

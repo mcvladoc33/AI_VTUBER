@@ -68,12 +68,19 @@ class TTSHandler:
         self.config = config
         self.tts_config = config.get('tts', {})
 
-        # Обмежуємо потоки PyTorch ДО створення моделі — інакше StyleTTS2
-        # хапає всі доступні ядра і конкурує з LLM-decode за той самий бюджет
+        # Який рушій синтезу використовувати: "pytorch" (дефолт, з підтримкою
+        # клонування голосу mode=2) або "onnx" (швидше на CPU, лише пресети)
+        self.engine = str(self.tts_config.get("engine", "pytorch")).strip().lower()
+        if self.engine not in ("pytorch", "onnx"):
+            log.warning(f"⚠️ [TTS] Невідомий tts.engine='{self.engine}', відкочуюсь на 'pytorch'.")
+            self.engine = "pytorch"
+
+        # Обмежуємо потоки ДО створення моделі — інакше рушій хапає всі
+        # доступні ядра і конкурує з LLM-decode за той самий бюджет
         tts_threads = self.tts_config.get("n_threads", 2)
         torch.set_num_threads(tts_threads)
         torch.set_num_interop_threads(1)
-        log.info(f"🧵 [TTS] Кількість потоків PyTorch обмежено до {tts_threads}.")
+        log.info(f"🧵 [TTS] Кількість потоків обмежено до {tts_threads} (рушій: {self.engine.upper()}).")
 
         self.text_queue = queue.Queue()
         self.audio_queue = queue.Queue()
@@ -115,16 +122,16 @@ class TTSHandler:
             except Exception as e:
                 log.warning(f"⚠️ [TTS] mBART не завантажено ({e}), працює алгоритмічна заміна.")
 
-        from styletts2_inference.models import StyleTTS2
-        self.multi_model = StyleTTS2(hf_path=self.styletts_path, device=self.device)
+        # self.multi_model лишається None для ONNX-рушія — весь стан живе
+        # в self.onnx_session, а self.tokenizer спільний для обох гілок
+        self.multi_model = None
+        self.onnx_session = None
+        self.tokenizer = None
 
-        try:
-            if hasattr(self.multi_model, 'model'):
-                self.multi_model.model.diffusion_steps = 1
-                if hasattr(self.multi_model.model, 'args'):
-                    self.multi_model.model.args.diffusion_steps = 1
-        except Exception:
-            pass
+        if self.engine == "onnx":
+            self._init_onnx_engine()
+        else:
+            self._init_pytorch_engine()
 
         self.stressify = Stressifier()
         self.ipa_func = ipa
@@ -137,8 +144,9 @@ class TTSHandler:
             warm = normalize('NFKC', "Привіт")
             ps = self.ipa_func(self.stressify(warm))
             if ps:
-                _ = self.multi_model(self.multi_model.tokenizer.encode(ps),
-                                      speed=self.speed, s_prev=self.style.clone())
+                tokens = self.tokenizer.encode(ps)
+                warm_style = self._clone_style(self.style)
+                _ = self._synthesize(tokens, self.speed, warm_style)
             log.info("✅ [TTS] Прогрів синтезатора завершено.")
         except Exception as e:
             log.warning(f"⚠️ [TTS] Прогрів TTS не вдався: {e}")
@@ -146,9 +154,93 @@ class TTSHandler:
         threading.Thread(target=self._text_processing_worker, daemon=True).start()
         threading.Thread(target=self._audio_playback_worker, daemon=True).start()
 
+    def _init_pytorch_engine(self):
+        from styletts2_inference.models import StyleTTS2
+        self.multi_model = StyleTTS2(hf_path=self.styletts_path, device=self.device)
+        self.tokenizer = self.multi_model.tokenizer
+
+        try:
+            if hasattr(self.multi_model, 'model'):
+                self.multi_model.model.diffusion_steps = 1
+                if hasattr(self.multi_model.model, 'args'):
+                    self.multi_model.model.args.diffusion_steps = 1
+        except Exception:
+            pass
+
+    def _init_onnx_engine(self):
+        # Лінивий імпорт — onnxruntime не потрібен, якщо engine="pytorch",
+        # тож не змушуємо всіх ставити зайву залежність
+        import onnxruntime as ort
+        from styletts2_inference.models import StyleTTS2Tokenizer
+
+        onnx_path = self.tts_config.get("onnx_model_path", "models/styletts2.onnx")
+        if not os.path.isabs(onnx_path):
+            onnx_path = os.path.join(BASE_DIR, onnx_path)
+
+        if not os.path.exists(onnx_path):
+            raise FileNotFoundError(f"❌ [TTS] ONNX-модель не знайдено: {onnx_path}")
+
+        tts_threads = self.tts_config.get("n_threads", 2)
+        sess_options = ort.SessionOptions()
+        sess_options.intra_op_num_threads = tts_threads
+        sess_options.inter_op_num_threads = 1
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+        self.onnx_session = ort.InferenceSession(
+            onnx_path,
+            sess_options=sess_options,
+            providers=["CPUExecutionProvider"]
+        )
+        # Токенайзер локальний, hf_hub_download вже запатчено вище на офлайн-шлях
+        self.tokenizer = StyleTTS2Tokenizer(hf_path=self.styletts_path)
+
+        log.info(f"⚡ [TTS] ONNX Runtime ініціалізовано ({os.path.basename(onnx_path)}, "
+                 f"{tts_threads} потоків).")
+
+    def _clone_style(self, style):
+        """Копія вектора стилю, сумісна з поточним рушієм (torch.Tensor або np.ndarray)."""
+        if self.engine == "onnx":
+            return style.copy()
+        return style.clone()
+
+    def _add_style_noise(self, style):
+        """Додає невеликий шум до стилю для природної варіативності голосу."""
+        if self.noise_scale <= 0:
+            return style
+        if self.engine == "onnx":
+            noise = np.random.randn(*style.shape).astype(np.float32) * self.noise_scale
+            return style + noise
+        style += torch.randn_like(style) * self.noise_scale
+        return style
+
+    def _synthesize(self, tokens, speed, style):
+        """Єдина точка синтезу — повертає float32 numpy-хвилю незалежно від рушія."""
+        if self.engine == "onnx":
+            tokens_np = tokens.numpy().astype(np.int64) if hasattr(tokens, "numpy") else np.asarray(tokens, dtype=np.int64)
+            style_np = style if isinstance(style, np.ndarray) else np.asarray(style, dtype=np.float32)
+            inputs = {
+                "tokens": tokens_np,
+                "speed": np.array(speed, dtype=np.float32),
+                "s_prev": style_np.astype(np.float32),
+            }
+            wav = self.onnx_session.run(None, inputs)[0]
+            return np.asarray(wav).flatten()
+
+        wav = self.multi_model(tokens, speed=speed, s_prev=style)
+        return wav.cpu().numpy().flatten()
+
     def _prepare_voice(self):
         mode_str = str(self.mode).strip()
         if mode_str == "2":
+            # Динамічне клонування голосу потребує voice-encoder з повної
+            # PyTorch-моделі — ONNX-граф його не містить (лише синтез за
+            # готовим вектором стилю), тож ця комбінація не підтримується.
+            if self.engine == "onnx":
+                raise ValueError(
+                    "❌ [TTS] Режим клонування голосу (tts.mode=2) не підтримується разом з "
+                    "tts.engine=onnx. Використай mode=1 з готовим пресетом, або engine=pytorch."
+                )
+
             ref_file = self.tts_config.get("reference_filename", "sample.wav")
             ref_path = os.path.join(self.ref_dir, ref_file)
             if not os.path.exists(ref_path):
@@ -168,7 +260,17 @@ class TTSHandler:
             if not os.path.exists(preset_path):
                 raise FileNotFoundError(f"❌ Пресет '{preset_file}' не знайдено.")
 
-            self.style = torch.load(preset_path, map_location=self.device)
+            raw_style = torch.load(preset_path, map_location='cpu')
+
+            if self.engine == "onnx":
+                # ONNX-сесія працює з float32 numpy-масивами, не з torch.Tensor
+                arr = raw_style.detach().cpu().numpy().astype(np.float32)
+                if arr.ndim == 1:
+                    arr = np.expand_dims(arr, axis=0)
+                self.style = arr
+            else:
+                self.style = raw_style.to(self.device)
+
             log.info(f"👤 [TTS] Успішно активовано пресет: {preset_file}")
 
     def _split_to_parts(self, text_data):
@@ -271,13 +373,14 @@ class TTSHandler:
 
                 mode_str = str(self.mode).strip()
                 if mode_str == "2" and self.match_duration and self.target_duration:
+                    # mode=2 гарантовано означає engine=pytorch (перевірено в _prepare_voice)
                     temp_wavs = []
                     for t in parts:
                         t_norm = normalize('NFKC', t.replace('+', StressSymbol.CombiningAcuteAccent))
                         ps = self.ipa_func(self.stressify(t_norm))
                         if ps:
-                            tokens = self.multi_model.tokenizer.encode(ps)
-                            w = self.multi_model(tokens, speed=1.0, s_prev=self.style)
+                            tokens = self.tokenizer.encode(ps)
+                            w = self._synthesize(tokens, 1.0, self.style)
                             temp_wavs.append(w)
                     if temp_wavs:
                         gen_len = sum(len(w) for w in temp_wavs) / 24000
@@ -292,17 +395,15 @@ class TTSHandler:
                     t_norm = normalize('NFKC', t.replace('+', StressSymbol.CombiningAcuteAccent))
                     ps = self.ipa_func(self.stressify(t_norm))
                     if ps:
-                        tokens = self.multi_model.tokenizer.encode(ps)
+                        tokens = self.tokenizer.encode(ps)
 
                         if self.style is None:
                             raise ValueError("Об'єкт стилю не ініціалізовано.")
 
-                        current_style = self.style.clone()
-                        if self.noise_scale > 0:
-                            current_style += torch.randn_like(current_style) * self.noise_scale
+                        current_style = self._clone_style(self.style)
+                        current_style = self._add_style_noise(current_style)
 
-                        wav = self.multi_model(tokens, speed=final_speed, s_prev=current_style)
-                        audio_chunk = wav.cpu().numpy().flatten()
+                        audio_chunk = self._synthesize(tokens, final_speed, current_style)
 
                         block_wavs.append(audio_chunk)
 
