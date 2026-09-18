@@ -1,8 +1,27 @@
 import os
 import re
 import time
+import ctypes
 from llama_cpp import Llama
+import llama_cpp
 from logger_config import log
+
+
+# --- Фікс "Exception ignored on calling ctypes callback function" ---
+# llama.cpp логує через C-колбек (llama_log_set). Якщо не тримати сильне
+# посилання на цей колбек десь на рівні модуля, Python GC прибирає його
+# ще до того, як бібліотека встигає ним скористатись — звідси
+# "Exception ignored ... llama_log_callback" в консолі. verbose=False у
+# Llama(...) не рятує — він лише притишує python-рівень, а не C-рівень.
+# Реєструємо власний мовчазний колбек і тримаємо сильне посилання на
+# module-рівні (_LLAMA_LOG_CALLBACK), щоб GC його не чіпав — це заразом
+# і прибирає шумні рядки типу "n_ctx_seq (...) < n_ctx_train (...)".
+def _silent_llama_log(level, message, user_data):
+    pass
+
+
+_LLAMA_LOG_CALLBACK = llama_cpp.llama_log_callback(_silent_llama_log)
+llama_cpp.llama_log_set(_LLAMA_LOG_CALLBACK, ctypes.c_void_p())
 
 
 class LLMHandler:
