@@ -30,8 +30,8 @@ huggingface_hub.hf_hub_download = local_hub_download
 # 3. Імпортуємо модель
 from styletts2_inference.models import StyleTTS2
 
-audio_path = "./references/sample.wav"
-output_pt_path = "./voices/my_voice.pt"
+audio_path = "./references/fv_anime-girl-shy.mp3"
+output_pt_path = "./voices/fv_anime-girl-shy.pt"
 
 print("⏳ Ініціалізація локальної моделі...")
 model = StyleTTS2(hf_path="local_override") 
