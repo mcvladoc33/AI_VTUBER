@@ -4,6 +4,7 @@ import time
 import warnings
 import threading
 import queue
+from concurrent.futures import ThreadPoolExecutor
 from unicodedata import normalize
 
 warnings.filterwarnings("ignore", category=UserWarning, message=".*TypedStorage is deprecated.*")
@@ -104,26 +105,66 @@ class TTSHandler:
         self.match_duration = self.tts_config.get("match_duration", False)
         self.use_verbalizer = self.tts_config.get("use_verbalizer", False)
 
+        # Максимальна довжина ОДНОГО шматка для одного виклику StyleTTS2.
+        # Не про мердж кількох речень докупи (той більше не робимо — див.
+        # _split_to_parts), а про те, коли ОДНЕ речення настільки довге,
+        # що його варто розрізати по комах/тире, щоб не змушувати
+        # користувача чекати на весь монолог одним викликом.
+        self.max_chunk_chars = self.tts_config.get("max_chunk_chars", 140)
+
+        # Скільки шматків тексту синтезувати ОДНОЧАСНО замість по черзі.
+        # 1 = стара послідовна поведінка. Синтез кожного шматка все одно
+        # обмежений спільним пулом потоків рушія (torch.set_num_threads /
+        # onnxruntime intra_op_num_threads = tts.n_threads) — тому паралель
+        # тут не про "більше ядер", а про краще заповнення простоїв
+        # усередині одного forward-проходу короткими шматками.
+        # ОБЕРЕЖНО з engine="pytorch": конкурентна безпека самого forward
+        # виклику StyleTTS2 (styletts2_inference) під питанням — бібліотека
+        # не документує це явно. engine="onnx" безпечніший — ONNX Runtime
+        # офіційно підтримує паралельні Run() на одній сесії.
+        self.parallel_chunks = max(1, int(self.tts_config.get("parallel_chunks", 1)))
+        self._synth_pool = ThreadPoolExecutor(
+            max_workers=self.parallel_chunks,
+            thread_name_prefix="tts-synth"
+        )
+
         self.is_first_chunk = True
         self._session_wavs = []
+        # Час завершення відтворення попереднього шматка в межах ПОТОЧНОЇ
+        # репліки. За ним _audio_playback_worker визначає реальну "тишу" —
+        # паузу, яку фактично чує користувач між шматками, незалежно від
+        # того, LLM чи TTS її спричинили. None між репліками (див.
+        # reset_session), щоб природна пауза "чекаю наступного вводу" не
+        # плуталась із паузою всередині монологу.
+        self._last_playback_finish = None
 
+        # УВАГА: це окремий токенайзер mBART для вербалізації чисел, а НЕ
+        # токенайзер StyleTTS2 (той — self.tokenizer, див. нижче). Раніше
+        # обидва звались self.tokenizer — коли додався перемикач рушіїв,
+        # ініціалізація рушія переписувала цей об'єкт значенням токенайзера
+        # StyleTTS2 вже ПІСЛЯ цього блоку, тихо ламаючи use_verbalizer=true
+        # (self.tokenizer(text) викликав би не той токенайзер). Розведено
+        # по різних іменах, щоб цей клас конфліктів більше не повторювався.
         self.verbalizer_model = None
-        self.tokenizer = None
+        self.verbalizer_tokenizer = None
         if self.use_verbalizer:
             from transformers import MBartForConditionalGeneration, MBart50TokenizerFast
             try:
-                self.tokenizer = MBart50TokenizerFast.from_pretrained(self.verbalizer_path, local_files_only=True)
+                self.verbalizer_tokenizer = MBart50TokenizerFast.from_pretrained(
+                    self.verbalizer_path, local_files_only=True
+                )
                 self.verbalizer_model = MBartForConditionalGeneration.from_pretrained(
                     self.verbalizer_path, local_files_only=True
                 ).to(self.device)
-                self.tokenizer.src_lang = "uk_UA"
-                self.tokenizer.tgt_lang = "uk_UA"
+                self.verbalizer_tokenizer.src_lang = "uk_UA"
+                self.verbalizer_tokenizer.tgt_lang = "uk_UA"
                 log.info("✅ [TTS] Вербалізатор mBART успішно завантажено.")
             except Exception as e:
                 log.warning(f"⚠️ [TTS] mBART не завантажено ({e}), працює алгоритмічна заміна.")
 
         # self.multi_model лишається None для ONNX-рушія — весь стан живе
-        # в self.onnx_session, а self.tokenizer спільний для обох гілок
+        # в self.onnx_session, а self.tokenizer (StyleTTS2, не mBART вище)
+        # спільний для обох гілок
         self.multi_model = None
         self.onnx_session = None
         self.tokenizer = None
@@ -204,11 +245,18 @@ class TTSHandler:
         return style.clone()
 
     def _add_style_noise(self, style):
-        """Додає невеликий шум до стилю для природної варіативності голосу."""
+        """Додає невеликий шум до стилю для природної варіативності голосу.
+
+        Для ONNX-гілки навмисно НЕ використовує np.random.randn/np.random.*
+        (глобальний RNG NumPy не є потокобезпечним) — при паралельному
+        синтезі (tts.parallel_chunks > 1) кілька потоків одночасно писали б
+        у той самий глобальний стан. np.random.default_rng() створює
+        незалежний генератор на кожен виклик, тож гонки даних немає."""
         if self.noise_scale <= 0:
             return style
         if self.engine == "onnx":
-            noise = np.random.randn(*style.shape).astype(np.float32) * self.noise_scale
+            rng = np.random.default_rng()
+            noise = rng.standard_normal(style.shape).astype(np.float32) * self.noise_scale
             return style + noise
         style += torch.randn_like(style) * self.noise_scale
         return style
@@ -228,6 +276,30 @@ class TTSHandler:
 
         wav = self.multi_model(tokens, speed=speed, s_prev=style)
         return wav.cpu().numpy().flatten()
+
+    def _synthesize_part(self, t, speed):
+        """Синтезує ОДНУ вже нарізану частину тексту. Винесено окремо від
+        _text_processing_worker, щоб можна було виконувати кілька частин
+        одночасно через self._synth_pool (tts.parallel_chunks) — поки одна
+        ще рахується, наступна вже стартує, а не чекає своєї черги.
+        Повертає (audio_chunk, elapsed_seconds), audio_chunk=None якщо
+        після очищення тексту не лишилось фонем для синтезу."""
+        part_start = time.time()
+        t_norm = normalize('NFKC', t.replace('+', StressSymbol.CombiningAcuteAccent))
+        ps = self.ipa_func(self.stressify(t_norm))
+        if not ps:
+            return None, 0.0
+
+        tokens = self.tokenizer.encode(ps)
+
+        if self.style is None:
+            raise ValueError("Об'єкт стилю не ініціалізовано.")
+
+        current_style = self._clone_style(self.style)
+        current_style = self._add_style_noise(current_style)
+
+        audio_chunk = self._synthesize(tokens, speed, current_style)
+        return audio_chunk, time.time() - part_start
 
     def _prepare_voice(self):
         mode_str = str(self.mode).strip()
@@ -274,14 +346,25 @@ class TTSHandler:
             log.info(f"👤 [TTS] Успішно активовано пресет: {preset_file}")
 
     def _split_to_parts(self, text_data):
-        MAX_CHARS = 240
-
-        sentences = re.split(r'([.!?;:—–])(?=(?:[^"]*"[^"]*")*[^"]*$)(?=(?:[^«]*«[^»]*»)*[^»]*$)', text_data)
+        # Ключова зміна порівняно зі старою версією: тут БІЛЬШЕ НЕ мерджимо
+        # кілька завершених речень в один блок до MAX_CHARS. Раніше блок
+        # "Мені потрібні деталі, друже. Ти ж не хочеш нудної відповіді від
+        # Селті. Я готова до епічних описів." (98 симв., 3 речення) йшов
+        # ОДНИМ викликом StyleTTS2 і користувач чекав 9+ секунд до першого
+        # звуку. Тепер кожне завершене речення — окремий виклик: перше
+        # аудіо звучить за час одного речення (~3-4с), а не всього блоку.
+        # ВАЖЛИВО: тут лишились ЛИШЕ справжні кінці речення (. ! ? …).
+        # Тире (—/–), двокрапка й крапка з комою — НЕ кінці речення,
+        # вони йдуть у _split_long_sentence нижче. Раніше вони теж
+        # ловились тут, і речення типу "Чотири — це вже не так просто"
+        # розривалось прямо на тире як на дві "сентенції" — звідси й
+        # ефект заїкання/обрубаних фраз у TTS.
+        sentences = re.split(r'([.!?…])(?=(?:[^"]*"[^"]*")*[^"]*$)(?=(?:[^«]*«[^»]*»)*[^»]*$)', text_data)
         raw, cur = [], ""
         for item in sentences:
             if not item:
                 continue
-            if item in '.!?;:—–':
+            if item in '.!?…':
                 cur += item
                 raw.append(cur.strip())
                 cur = ""
@@ -290,29 +373,76 @@ class TTSHandler:
         if cur.strip():
             raw.append(cur.strip())
 
+        # Єдиний виняток — геть крихітні "хвостики" (типу самотнього "Так."
+        # після попереднього речення): їх усе ж клеїмо до сусіда, інакше
+        # плодимо виклики StyleTTS2 з фіксованим оверхедом ~4с на секунди
+        # користі. MIN_STANDALONE навмисно малий — це не про мердж речень
+        # заради швидкості, а про відсікання виродкових уламків парсингу.
+        MIN_STANDALONE = 12
         merged = []
-        acc = ""
         for s in raw:
             if not s:
                 continue
-            if not acc:
-                acc = s
-            elif len(acc) + len(s) + 1 <= MAX_CHARS:
-                acc += " " + s
+            if merged and len(s) < MIN_STANDALONE:
+                merged[-1] = merged[-1] + " " + s
             else:
-                merged.append(acc)
-                acc = s
-        if acc:
-            merged.append(acc)
+                merged.append(s)
 
         final = []
         for chunk in merged:
-            if len(chunk) <= MAX_CHARS:
+            if len(chunk) <= self.max_chunk_chars:
+                final.append(chunk)
+                continue
+            final.extend(self._split_long_sentence(chunk))
+
+        return [p for p in final if p]
+
+    def _split_long_sentence(self, sentence):
+        """Ріже ОДНЕ задовге речення по логічних розділових знаках (кома,
+        крапка з комою, тире) — це звучить природніше за розрив по слову
+        і дає той самий ефект швидшого першого звуку для речень, які самі
+        по собі довші за self.max_chunk_chars."""
+        pieces = re.split(r'([,;:—–])', sentence)
+        parts, cur = [], ""
+        for item in pieces:
+            if not item:
+                continue
+            if item in ',;:—–':
+                cur += item
+                parts.append(cur.strip())
+                cur = ""
+            else:
+                cur += item
+        if cur.strip():
+            parts.append(cur.strip())
+
+        # Клеїмо сусідні шматки коми, поки влазять у ліміт — щоб не
+        # озвучувати кожну кому окремим мікро-викликом
+        merged = []
+        acc = ""
+        for p in parts:
+            if not p:
+                continue
+            if not acc:
+                acc = p
+            elif len(acc) + len(p) + 1 <= self.max_chunk_chars:
+                acc += " " + p
+            else:
+                merged.append(acc)
+                acc = p
+        if acc:
+            merged.append(acc)
+
+        # Фолбек: якщо в реченні взагалі немає ком/тире (тому не розрізалось
+        # вище) і воно все ще задовге — ріжемо по словах, як і раніше
+        final = []
+        for chunk in merged:
+            if len(chunk) <= self.max_chunk_chars:
                 final.append(chunk)
                 continue
             words, temp = chunk.split(' '), ""
             for w in words:
-                if len(temp) + len(w) + 1 > MAX_CHARS and temp:
+                if len(temp) + len(w) + 1 > self.max_chunk_chars and temp:
                     final.append(temp.strip())
                     temp = w
                 else:
@@ -320,7 +450,7 @@ class TTSHandler:
             if temp.strip():
                 final.append(temp.strip())
 
-        return [p for p in final if p]
+        return final
 
     def _text_processing_worker(self):
         while True:
@@ -349,15 +479,15 @@ class TTSHandler:
                     if not s.strip():
                         continue
                     if self.use_verbalizer and self.verbalizer_model and re.search(r'\d+', s):
-                        inputs = self.tokenizer(s, return_tensors="pt", padding=True).to(self.device)
+                        inputs = self.verbalizer_tokenizer(s, return_tensors="pt", padding=True).to(self.device)
                         generated_tokens = self.verbalizer_model.generate(
                             **inputs,
-                            forced_bos_token_id=self.tokenizer.lang_code_to_id["uk_UA"],
+                            forced_bos_token_id=self.verbalizer_tokenizer.lang_code_to_id["uk_UA"],
                             max_length=len(s) + 40,
                             no_repeat_ngram_size=3,
                             early_stopping=True
                         )
-                        clean_s = self.tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0]
+                        clean_s = self.verbalizer_tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0]
                         processed_sentences.append(clean_s.strip())
                     else:
                         processed_sentences.append(s.strip())
@@ -390,28 +520,26 @@ class TTSHandler:
 
                 block_wavs = []
 
-                for i, t in enumerate(parts, 1):
-                    part_start = time.time()
-                    t_norm = normalize('NFKC', t.replace('+', StressSymbol.CombiningAcuteAccent))
-                    ps = self.ipa_func(self.stressify(t_norm))
-                    if ps:
-                        tokens = self.tokenizer.encode(ps)
+                # Всі частини блоку відправляються в пул одразу (submit),
+                # а результати забираються В ПОРЯДКУ НАДХОДЖЕННЯ через
+                # future.result() — навіть якщо шматок 3 порахувався
+                # раніше за шматок 2, у чергу відтворення він потрапить
+                # лише після 2-го. Паралелізм є (при parallel_chunks > 1
+                # кілька .result() вже виконуються у фоні одночасно), а
+                # порядок мовлення лишається природним.
+                futures = [self._synth_pool.submit(self._synthesize_part, t, final_speed) for t in parts]
 
-                        if self.style is None:
-                            raise ValueError("Об'єкт стилю не ініціалізовано.")
+                for i, (t, fut) in enumerate(zip(parts, futures), 1):
+                    audio_chunk, part_time = fut.result()
+                    if audio_chunk is None:
+                        continue
 
-                        current_style = self._clone_style(self.style)
-                        current_style = self._add_style_noise(current_style)
+                    block_wavs.append(audio_chunk)
 
-                        audio_chunk = self._synthesize(tokens, final_speed, current_style)
+                    log.info(
+                        f"   📢 [StyleTTS2] Шматок {i}/{len(parts)} готовий за {part_time:.3f}s! ({len(t)} симв.) -> {t}")
 
-                        block_wavs.append(audio_chunk)
-
-                        part_time = time.time() - part_start
-                        log.info(
-                            f"   📢 [StyleTTS2] Шматок {i}/{len(parts)} готовий за {part_time:.3f}s! ({len(t)} симв.) -> {t}")
-
-                        self.audio_queue.put(audio_chunk)
+                    self.audio_queue.put(audio_chunk)
 
                 if block_wavs:
                     self._session_wavs.extend(block_wavs)
@@ -442,6 +570,15 @@ class TTSHandler:
             audio_data = self.audio_queue.get()
             if audio_data is None:
                 continue
+
+            if self._last_playback_finish is not None:
+                silence = time.time() - self._last_playback_finish
+                # Поріг 0.3с — щоб не спамити на дрібних, неминучих затримках
+                # планувальника ОС; це саме та "тиша", яку реально чує
+                # користувач між двома шматками ОДНІЄЇ репліки
+                if silence > 0.3:
+                    log.info(f"   🤫 [SYSTEM] Тиша {silence:.2f}s перед наступним шматком")
+
             try:
                 sd.play(audio_data, 24000)
                 sd.wait()
@@ -449,6 +586,7 @@ class TTSHandler:
                 log.warning(f"⚠️ [Playback Error]: {play_err}")
             finally:
                 self.audio_queue.task_done()
+                self._last_playback_finish = time.time()
 
     def play_text_async(self, text: str):
         if not text.strip():
@@ -465,3 +603,6 @@ class TTSHandler:
     def reset_session(self):
         self.is_first_chunk = True
         self._session_wavs = []
+        # Скидаємо ДО початку нової репліки — природна пауза "чекаю на
+        # користувача" між репліками не повинна рахуватись як "тиша"
+        self._last_playback_finish = None

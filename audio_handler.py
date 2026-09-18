@@ -10,6 +10,15 @@ class AudioHandler:
         device = stt_config.get('device', 'cpu')
         compute_type = stt_config.get('compute_type', 'int8')
 
+        # VAD-параметри Whisper — окремі й незалежні від pre-roll у main.py.
+        # main.py ловить "фізичний" початок/кінець мовлення на рівні
+        # мікрофона; ці параметри — вже всередині вирізаного файлу, як
+        # Whisper сам ділить його на сегменти мовлення. speech_pad_ms —
+        # це запас з обох боків кожного знайденого сегмента: без нього
+        # Silero-VAD часто ріже впритул і губить перший/останній склад.
+        self.vad_min_silence_ms = stt_config.get('vad_min_silence_ms', 300)
+        self.vad_speech_pad_ms = stt_config.get('vad_speech_pad_ms', 300)
+
         log.info(f"🎙️ [STT] Завантаження Whisper ({model_size}) на {device.upper()} (Квантування: {compute_type})...")
 
         self.model = WhisperModel(
@@ -33,7 +42,10 @@ class AudioHandler:
             beam_size=1,
             best_of=1,
             vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=300),
+            vad_parameters=dict(
+                min_silence_duration_ms=self.vad_min_silence_ms,
+                speech_pad_ms=self.vad_speech_pad_ms
+            ),
             temperature=0.0,
             initial_prompt=technical_prompt,
             no_speech_threshold=0.6,

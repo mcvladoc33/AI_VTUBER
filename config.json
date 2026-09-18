@@ -2,7 +2,14 @@
   "stt": {
     "model_size": "small",
     "device": "cpu",
-    "compute_type": "int8"
+    "compute_type": "int8",
+    "vad_min_silence_ms": 300,
+    "vad_speech_pad_ms": 300
+  },
+  "mic": {
+    "threshold": 0.05,
+    "silence_duration": 2.0,
+    "pre_roll_ms": 350
   },
   "llm": {
     "model_path": "models/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf",
@@ -10,7 +17,7 @@
     "max_tokens": 180,
     "temperature": 0.65,
     "repeat_penalty": 1.15,
-    "n_threads": 1,
+    "n_threads": 2,
     "n_threads_batch": 4,
     "n_batch": 256
   },
@@ -24,6 +31,8 @@
     "noise_scale": 0.05,
     "match_duration": false,
     "use_verbalizer": false,
+    "max_chunk_chars": 140,
+    "parallel_chunks": 1,
     "n_threads": 3
   },
   "character": {
