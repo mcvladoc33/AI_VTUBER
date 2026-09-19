@@ -83,7 +83,12 @@ def main():
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         config = json.load(f)
 
-    stt_module = AudioHandler(config)
+    text_mode = config.get('text_mode', False)
+
+    # У текстовому режимі STT (Whisper) взагалі не використовується —
+    # немає сенсу вантажити модель у пам'ять і платити за її ініціалізацію,
+    # якщо мікрофон цього разу не потрібен
+    stt_module = None if text_mode else AudioHandler(config)
     llm_module = LLMHandler(config)
     tts_module = TTSHandler(config)
 
@@ -93,7 +98,6 @@ def main():
     mic_pre_roll_ms = mic_config.get('pre_roll_ms', 350)
 
     char_name = config.get('character', {}).get('name', 'Помічниця')
-    text_mode = config.get('text_mode', False)
 
     log.info("🚀 [SYSTEM] Помічниця повністю готова до роботи!")
     if text_mode:

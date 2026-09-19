@@ -83,7 +83,7 @@ class LLMHandler:
         except Exception as e:
             log.warning(f"⚠️ [LLM] Прогрів не вдався (некритично): {e}")
 
-    def generate_response(self, text: str):
+    def generate_response(self, text: str, seed: int = None):
         if not self.model:
             yield "Помилка: Модель ШІ не завантажена."
             return
@@ -95,7 +95,7 @@ class LLMHandler:
             prompt += f"{'User' if turn['role'] == 'user' else 'Assistant'}: {turn['text']}\n"
         prompt += "Assistant:"
 
-        response_stream = self.model(
+        gen_kwargs = dict(
             prompt=prompt,
             max_tokens=self.llm_config.get('max_tokens', 180),
             temperature=self.llm_config.get('temperature', 0.65),
@@ -104,6 +104,15 @@ class LLMHandler:
             stream=True,
             echo=False
         )
+        # seed=None (дефолт) — звичайна жива розмова, щоразу інша відповідь.
+        # Фіксований seed — лише для benchmark.py: та сама фраза + той самий
+        # seed = той самий текст щоразу, інакше порівняння конфігурацій
+        # (n_threads, engine, parallel_chunks) забруднюється ще й
+        # випадковістю самого семплінгу LLM, а не лише швидкістю заліза.
+        if seed is not None:
+            gen_kwargs["seed"] = seed
+
+        response_stream = self.model(**gen_kwargs)
 
         # Гібридна стратегія: перший шматок — маленький (швидкий старт),
         # решта — великі (економія на фіксованому оверхеді TTS)

@@ -32,7 +32,7 @@
     "match_duration": false,
     "use_verbalizer": false,
     "max_chunk_chars": 140,
-    "parallel_chunks": 1,
+    "parallel_chunks": 2,
     "n_threads": 3
   },
   "character": {

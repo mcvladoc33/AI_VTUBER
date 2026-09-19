@@ -80,7 +80,19 @@ class TTSHandler:
         # доступні ядра і конкурує з LLM-decode за той самий бюджет
         tts_threads = self.tts_config.get("n_threads", 2)
         torch.set_num_threads(tts_threads)
-        torch.set_num_interop_threads(1)
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            # PyTorch дозволяє встановити interop-потоки лише ОДИН раз за
+            # весь час життя процесу, незалежно від значення. У main.py
+            # TTSHandler створюється рівно один раз — це ніколи не
+            # спрацьовує. Але benchmark.py навмисно створює по TTSHandler
+            # на кожен варіант конфігурації В ОДНОМУ процесі (щоб не
+            # платити за перезапуск Python щоразу) — і другий виклик з
+            # ТИМ САМИМ значенням 1 все одно кидає RuntimeError. Значення
+            # від першого виклику вже діє на весь процес, тож просто
+            # ігноруємо повторну спробу, а не падаємо.
+            pass
         log.info(f"🧵 [TTS] Кількість потоків обмежено до {tts_threads} (рушій: {self.engine.upper()}).")
 
         self.text_queue = queue.Queue()
@@ -137,6 +149,15 @@ class TTSHandler:
         # reset_session), щоб природна пауза "чекаю наступного вводу" не
         # плуталась із паузою всередині монологу.
         self._last_playback_finish = None
+
+        # Ті самі числа, що йдуть у log.info нижче, але у "сирому" вигляді
+        # для зовнішніх інструментів (напр. benchmark.py) — щоб не парсити
+        # текст логів. chunk_metrics: [{"text","chars","elapsed"}, ...] —
+        # один запис на кожен синтезований шматок ПОТОЧНОЇ репліки.
+        # silence_log: [float, ...] — КОЖНА виміряна пауза перед шматком,
+        # включно з тими, що нижче порогу 0.3с для друку в лог.
+        self.chunk_metrics = []
+        self.silence_log = []
 
         # УВАГА: це окремий токенайзер mBART для вербалізації чисел, а НЕ
         # токенайзер StyleTTS2 (той — self.tokenizer, див. нижче). Раніше
@@ -536,6 +557,8 @@ class TTSHandler:
 
                     block_wavs.append(audio_chunk)
 
+                    self.chunk_metrics.append({"text": t, "chars": len(t), "elapsed": part_time})
+
                     log.info(
                         f"   📢 [StyleTTS2] Шматок {i}/{len(parts)} готовий за {part_time:.3f}s! ({len(t)} симв.) -> {t}")
 
@@ -573,9 +596,12 @@ class TTSHandler:
 
             if self._last_playback_finish is not None:
                 silence = time.time() - self._last_playback_finish
+                self.silence_log.append(silence)
                 # Поріг 0.3с — щоб не спамити на дрібних, неминучих затримках
                 # планувальника ОС; це саме та "тиша", яку реально чує
-                # користувач між двома шматками ОДНІЄЇ репліки
+                # користувач між двома шматками ОДНІЄЇ репліки. Поріг лише
+                # для друку в лог — у silence_log вище пишемо БУДЬ-яке
+                # значення, щоб benchmark.py мав повну картину.
                 if silence > 0.3:
                     log.info(f"   🤫 [SYSTEM] Тиша {silence:.2f}s перед наступним шматком")
 
@@ -606,3 +632,16 @@ class TTSHandler:
         # Скидаємо ДО початку нової репліки — природна пауза "чекаю на
         # користувача" між репліками не повинна рахуватись як "тиша"
         self._last_playback_finish = None
+        self.chunk_metrics = []
+        self.silence_log = []
+
+    def shutdown(self):
+        """Акуратне завершення пулу потоків синтезу. main.py живе один раз
+        за весь процес і в цьому не потребує — але інструменти на кшталт
+        benchmark.py створюють по TTSHandler на кожну тестовану
+        конфігурацію в одному процесі, і без явного shutdown пули потоків
+        від попередніх варіантів накопичувались би до кінця скрипта."""
+        try:
+            self._synth_pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
