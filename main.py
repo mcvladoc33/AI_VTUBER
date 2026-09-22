@@ -85,6 +85,19 @@ def main():
 
     text_mode = config.get('text_mode', False)
 
+    # Один зведений банер замість розкиданих по різних модулях рядків —
+    # раніше LLM-потоки не показувались узагалі, а TTS-потоки друкувались
+    # двічі (в TTSHandler і ще раз в ONNX-гілці)
+    llm_cfg = config.get('llm', {})
+    tts_cfg = config.get('tts', {})
+    log.info("🖥️  [SYSTEM] Розподіл потоків CPU:")
+    log.info(f"     LLM → n_threads={llm_cfg.get('n_threads', 2)} (генерація), "
+             f"n_threads_batch={llm_cfg.get('n_threads_batch', 4)} (обробка запиту)")
+    log.info(f"     TTS → n_threads={tts_cfg.get('n_threads', 2)} "
+             f"(рушій: {str(tts_cfg.get('engine', 'pytorch')).upper()}), "
+             f"parallel_chunks={tts_cfg.get('parallel_chunks', 1)}")
+    log.info("-" * 60)
+
     # У текстовому режимі STT (Whisper) взагалі не використовується —
     # немає сенсу вантажити модель у пам'ять і платити за її ініціалізацію,
     # якщо мікрофон цього разу не потрібен
@@ -137,32 +150,45 @@ def main():
 
             log.info(f"🤖 {char_name}:")
 
-            is_first_sentence = True
             start_llm = time.time()
+            tts_module.start_turn_timer(start_llm)
+
+            is_first_sentence = True
             last_yield_time = start_llm
+            llm_total = 0.0
 
             for sentence in llm_module.generate_response(user_input):
                 now = time.time()
+
                 if is_first_sentence:
-                    llm_first_token_time = now - start_llm
-                    log.info(f" ⏱️ [Пошук думки: {llm_first_token_time:.2f}s]")
+                    seg_time = now - start_llm
                     is_first_sentence = False
                 else:
                     # Скільки LLM генерував саме ЦЕЙ відрізок (не з нуля, а
                     # від моменту, коли попередній уже пішов у TTS) — без
                     # цього не видно, чи саме LLM гальмує пізніші речення
-                    gap = now - last_yield_time
-                    log.info(f" ⏱️ [LLM] Наступний відрізок за {gap:.2f}s")
+                    seg_time = now - last_yield_time
                 last_yield_time = now
+                llm_total += seg_time
 
-                log.info(f" ➔ {sentence}")
-
+                # llm_time іде разом із текстом — TTSHandler сам надрукує
+                # звіт по цій фразі ЖИВЦЕМ, у момент реального відтворення
+                # (у _audio_playback_worker), а не постфактум одним махом
                 try:
-                    tts_module.play_text_async(sentence)
+                    tts_module.play_text_async(sentence, llm_time=seg_time)
                 except Exception as tts_err:
                     log.error(f" └─ ❌ [Помилка TTS]: {tts_err}")
 
             tts_module.wait_until_done()
+
+            tts_total = sum(c["synth_time"] for c in tts_module.chunk_metrics)
+            silence_total = sum(tts_module.silence_log)
+            wall_total = time.time() - start_llm
+            log.info(
+                f"  📊 LLM {llm_total:.2f}s | TTS {tts_total:.2f}s | "
+                f"тиша {silence_total:.2f}s | всього {wall_total:.2f}s"
+            )
+
             tts_module.flush_session_audio()
             log.info("-" * 60)
 

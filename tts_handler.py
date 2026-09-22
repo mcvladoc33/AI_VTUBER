@@ -64,6 +64,11 @@ def utf8_open(*args, **kwargs):
 styletts2_inference.models.open = utf8_open
 
 
+# Унікальний сентинел для зупинки фонових потоків (не просто None — None
+# уже використовується як "порожній сигнал, ігноруй" в обох чергах).
+_STOP_SENTINEL = object()
+
+
 class TTSHandler:
     def __init__(self, config):
         self.config = config
@@ -93,7 +98,9 @@ class TTSHandler:
             # від першого виклику вже діє на весь процес, тож просто
             # ігноруємо повторну спробу, а не падаємо.
             pass
-        log.info(f"🧵 [TTS] Кількість потоків обмежено до {tts_threads} (рушій: {self.engine.upper()}).")
+        # Кількість потоків тепер друкується один раз у зведеному банері
+        # main.py на старті (разом з LLM і parallel_chunks) — тут більше
+        # не дублюємо цю інформацію.
 
         self.text_queue = queue.Queue()
         self.audio_queue = queue.Queue()
@@ -125,15 +132,27 @@ class TTSHandler:
         self.max_chunk_chars = self.tts_config.get("max_chunk_chars", 140)
 
         # Скільки шматків тексту синтезувати ОДНОЧАСНО замість по черзі.
-        # 1 = стара послідовна поведінка. Синтез кожного шматка все одно
-        # обмежений спільним пулом потоків рушія (torch.set_num_threads /
-        # onnxruntime intra_op_num_threads = tts.n_threads) — тому паралель
-        # тут не про "більше ядер", а про краще заповнення простоїв
-        # усередині одного forward-проходу короткими шматками.
-        # ОБЕРЕЖНО з engine="pytorch": конкурентна безпека самого forward
-        # виклику StyleTTS2 (styletts2_inference) під питанням — бібліотека
-        # не документує це явно. engine="onnx" безпечніший — ONNX Runtime
-        # офіційно підтримує паралельні Run() на одній сесії.
+        # 1 = дефолт, і НАВМИСНО. Синтез кожного шматка все одно обмежений
+        # спільним пулом потоків рушія (torch.set_num_threads /
+        # onnxruntime intra_op_num_threads = tts.n_threads) — тобто
+        # реального виграшу від "більше ядер" тут немає в принципі.
+        #
+        # ПІДТВЕРДЖЕНО: parallel_chunks > 1 ЛАМАЄ ЗВУК, не лише сповільнює.
+        # На живому тесті з engine="onnx" (не тільки "pytorch" — обидва
+        # рушії!) конкурентний синтез спричиняв чутне заїкання на початку
+        # окремих слів ("Ти" → "Т ииии", "Просто" → "Пр росто"). Судячи з
+        # локалізації (завжди на самому початку слова), причина — не сам
+        # onnxruntime.Run()/torch forward (вони документовано безпечні для
+        # конкурентних викликів), а препроцесинг ДО них: self.stressify()
+        # (ukrainian_word_stress), ipa_uk.ipa(), self.tokenizer.encode()
+        # (StyleTTS2Tokenizer) — жодна з цих зовнішніх бібліотек не
+        # документує потокобезпеку, і, судячи з симптому, десь усередині є
+        # спільний мутабельний стан (кеш/буфер), який ловить гонку даних
+        # рівно в момент старту обробки нового слова.
+        # Не вмикай > 1 без чіткого підтвердження, що ці три виклики
+        # дійсно потокобезпечні (напр. форкнути окремий екземпляр
+        # Stressifier/токенайзера на кожен потік пулу) — інакше це знову
+        # проявиться, можливо не одразу помітно на слух.
         self.parallel_chunks = max(1, int(self.tts_config.get("parallel_chunks", 1)))
         self._synth_pool = ThreadPoolExecutor(
             max_workers=self.parallel_chunks,
@@ -149,13 +168,20 @@ class TTSHandler:
         # reset_session), щоб природна пауза "чекаю наступного вводу" не
         # плуталась із паузою всередині монологу.
         self._last_playback_finish = None
+        # Момент початку ПОТОЧНОЇ репліки — від нього рахуємо "played_at"
+        # у chunk_metrics: скільки секунд минуло від запиту користувача до
+        # того, як САМЕ ЦЕ речення реально пролунало в динаміках. Це і є
+        # відповідь на "з якою затримкою випльовується кожне речення".
+        self._turn_start = time.time()
 
-        # Ті самі числа, що йдуть у log.info нижче, але у "сирому" вигляді
-        # для зовнішніх інструментів (напр. benchmark.py) — щоб не парсити
-        # текст логів. chunk_metrics: [{"text","chars","elapsed"}, ...] —
-        # один запис на кожен синтезований шматок ПОТОЧНОЇ репліки.
-        # silence_log: [float, ...] — КОЖНА виміряна пауза перед шматком,
-        # включно з тими, що нижче порогу 0.3с для друку в лог.
+        # Ті самі числа, що йдуть у лог, але у "сирому" вигляді для main.py
+        # (звіт друкується прямо в _audio_playback_worker, живцем) і
+        # зовнішніх інструментів (benchmark.py). chunk_metrics:
+        # [{"text","chars","synth_time","llm_time","combined","ready_at",
+        # "played_at","silence_before"}, ...] — один запис на кожен
+        # синтезований шматок ПОТОЧНОЇ репліки, у хронологічному порядку
+        # відтворення. "ready_at"/"played_at" — секунди від _turn_start.
+        # silence_log: [float, ...] — КОЖНА виміряна пауза перед шматком.
         self.chunk_metrics = []
         self.silence_log = []
 
@@ -213,8 +239,10 @@ class TTSHandler:
         except Exception as e:
             log.warning(f"⚠️ [TTS] Прогрів TTS не вдався: {e}")
 
-        threading.Thread(target=self._text_processing_worker, daemon=True).start()
-        threading.Thread(target=self._audio_playback_worker, daemon=True).start()
+        self._text_thread = threading.Thread(target=self._text_processing_worker, daemon=True)
+        self._text_thread.start()
+        self._playback_thread = threading.Thread(target=self._audio_playback_worker, daemon=True)
+        self._playback_thread.start()
 
     def _init_pytorch_engine(self):
         from styletts2_inference.models import StyleTTS2
@@ -256,8 +284,7 @@ class TTSHandler:
         # Токенайзер локальний, hf_hub_download вже запатчено вище на офлайн-шлях
         self.tokenizer = StyleTTS2Tokenizer(hf_path=self.styletts_path)
 
-        log.info(f"⚡ [TTS] ONNX Runtime ініціалізовано ({os.path.basename(onnx_path)}, "
-                 f"{tts_threads} потоків).")
+        log.info(f"⚡ [TTS] ONNX Runtime ініціалізовано ({os.path.basename(onnx_path)}).")
 
     def _clone_style(self, style):
         """Копія вектора стилю, сумісна з поточним рушієм (torch.Tensor або np.ndarray)."""
@@ -475,9 +502,13 @@ class TTSHandler:
 
     def _text_processing_worker(self):
         while True:
-            text = self.text_queue.get()
-            if text is None:
+            item = self.text_queue.get()
+            if item is _STOP_SENTINEL:
+                self.text_queue.task_done()
+                break
+            if item is None:
                 continue
+            text, llm_time = item
 
             if not text.strip():
                 self.text_queue.task_done()
@@ -557,12 +588,27 @@ class TTSHandler:
 
                     block_wavs.append(audio_chunk)
 
-                    self.chunk_metrics.append({"text": t, "chars": len(t), "elapsed": part_time})
+                    # LLM-час сегмента приписуємо ЛИШЕ першому під-шматку —
+                    # LLM генерував цей текст один раз, а не по разу на
+                    # кожен шматок, на які текст порізало для TTS
+                    llm_part = llm_time if i == 1 else 0.0
 
-                    log.info(
-                        f"   📢 [StyleTTS2] Шматок {i}/{len(parts)} готовий за {part_time:.3f}s! ({len(t)} симв.) -> {t}")
+                    metrics_entry = {
+                        "text": t,
+                        "chars": len(t),
+                        "synth_time": part_time,
+                        "llm_time": llm_part,
+                        "combined": llm_part + part_time,
+                        "ready_at": time.time() - self._turn_start,
+                        "played_at": None,       # заповнить _audio_playback_worker
+                        "silence_before": 0.0,   # заповнить _audio_playback_worker
+                    }
+                    self.chunk_metrics.append(metrics_entry)
 
-                    self.audio_queue.put(audio_chunk)
+                    # Той самий словник іде в чергу разом з аудіо — playback
+                    # worker надрукує звіт і допише played_at/silence_before
+                    # в НЬОГО Ж, а не в окремий паралельний список
+                    self.audio_queue.put((audio_chunk, metrics_entry))
 
                 if block_wavs:
                     self._session_wavs.extend(block_wavs)
@@ -590,10 +636,15 @@ class TTSHandler:
 
     def _audio_playback_worker(self):
         while True:
-            audio_data = self.audio_queue.get()
-            if audio_data is None:
+            item = self.audio_queue.get()
+            if item is _STOP_SENTINEL:
+                self.audio_queue.task_done()
+                break
+            if item is None:
                 continue
+            audio_data, metrics_entry = item
 
+            silence = 0.0
             if self._last_playback_finish is not None:
                 silence = time.time() - self._last_playback_finish
                 self.silence_log.append(silence)
@@ -603,7 +654,23 @@ class TTSHandler:
                 # для друку в лог — у silence_log вище пишемо БУДЬ-яке
                 # значення, щоб benchmark.py мав повну картину.
                 if silence > 0.3:
-                    log.info(f"   🤫 [SYSTEM] Тиша {silence:.2f}s перед наступним шматком")
+                    log.info(f"      ...тиша {silence:.2f}s...")
+
+            metrics_entry["silence_before"] = silence
+            metrics_entry["played_at"] = time.time() - self._turn_start
+
+            # Друкуємо САМЕ ТУТ, у момент, коли фраза реально йде в динаміки —
+            # не раніше (ще не готова) і не пізніше (вже неправда, що "зараз")
+            llm_part = metrics_entry["llm_time"]
+            synth = metrics_entry["synth_time"]
+            combined = metrics_entry["combined"]
+            if llm_part > 0.01:
+                log.info(
+                    f" ➔ {metrics_entry['text']}  [{combined:.2f}s = "
+                    f"{llm_part:.2f}с (думка) + {synth:.2f}с (синтез)]"
+                )
+            else:
+                log.info(f" ➔ {metrics_entry['text']}  [{combined:.2f}s = {synth:.2f}с (синтез)]")
 
             try:
                 sd.play(audio_data, 24000)
@@ -614,10 +681,10 @@ class TTSHandler:
                 self.audio_queue.task_done()
                 self._last_playback_finish = time.time()
 
-    def play_text_async(self, text: str):
+    def play_text_async(self, text: str, llm_time: float = 0.0):
         if not text.strip():
             return
-        self.text_queue.put(text)
+        self.text_queue.put((text, llm_time))
 
     def wait_until_done(self):
         self.text_queue.join()
@@ -635,13 +702,35 @@ class TTSHandler:
         self.chunk_metrics = []
         self.silence_log = []
 
+    def start_turn_timer(self, t: float = None):
+        """Позначає момент 'нуль' для played_at/ready_at у chunk_metrics.
+        Викликати ПІСЛЯ отримання вводу користувача (не в reset_session,
+        який іде ДО очікування вводу) — інакше час очікування "поки
+        людина набирає текст" рахувався б як затримка озвучки."""
+        self._turn_start = t if t is not None else time.time()
+
     def shutdown(self):
-        """Акуратне завершення пулу потоків синтезу. main.py живе один раз
-        за весь процес і в цьому не потребує — але інструменти на кшталт
-        benchmark.py створюють по TTSHandler на кожну тестовану
-        конфігурацію в одному процесі, і без явного shutdown пули потоків
-        від попередніх варіантів накопичувались би до кінця скрипта."""
+        """Акуратне завершення. main.py живе один раз за весь процес і в
+        цьому не потребує — але інструменти на кшталт benchmark.py
+        створюють по TTSHandler на кожну тестовану конфігурацію в одному
+        процесі.
+
+        КРИТИЧНО: без цього _text_thread/_playback_thread (нескінченні
+        while True на bound-методах self) тримають self живим ВІЧНО —
+        del tts_module у виклику нічого не звільняє, бо потік і досі живий
+        і досі тримає посилання. Модель/сесія кожного попереднього
+        варіанта лишались у пам'яті, накопичуючись від варіанта до
+        варіанта — саме це забивало RAM і заганяло систему в своп
+        задовго до найважчого (pytorch) варіанта."""
         try:
             self._synth_pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
+        try:
+            self.text_queue.put(_STOP_SENTINEL)
+            self.audio_queue.put(_STOP_SENTINEL)
+            self._text_thread.join(timeout=5)
+            self._playback_thread.join(timeout=5)
         except Exception:
             pass

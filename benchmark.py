@@ -36,6 +36,7 @@ import csv
 import copy
 import json
 import time
+import gc
 import argparse
 import statistics
 from datetime import datetime
@@ -62,11 +63,27 @@ VARIANTS = [
     ("onnx / llm=3 / tts=3 / par=1",
      {"llm": {"n_threads": 3}, "tts": {"engine": "onnx", "n_threads": 3, "parallel_chunks": 1}}),
 
+    # par=2 прибрано зі списку варіантів — ПІДТВЕРДЖЕНО, що ламає звук
+    # (чутне заїкання на початку слів), незалежно від рушія. Не тестуємо
+    # це знову, поки хтось не виправить потокобезпеку препроцесингу
+    # (Stressifier/ipa_uk/StyleTTS2Tokenizer) — див. коментар у
+    # tts_handler.py біля self.parallel_chunks.
+
+    ("onnx / llm=4 / tts=4 / par=1",
+     {"llm": {"n_threads": 4}, "tts": {"engine": "onnx", "n_threads": 4, "parallel_chunks": 1}}),
+
+    ("onnx / llm=3 / tts=4 / par=1",
+     {"llm": {"n_threads": 3}, "tts": {"engine": "onnx", "n_threads": 4, "parallel_chunks": 1}}),
+
+    # pytorch — НАВМИСНО останній у списку. Повна PyTorch-модель важить
+    # помітно більше (~1 ГБ понад ONNX, за раніше виміряним), і Python
+    # неохоче повертає звільнену пам'ять ОС одразу — якщо цей варіант
+    # запустити посередині списку, наступні (легші) варіанти можуть
+    # зачепити своп і показати спотворені, повільніші числа, які насправді
+    # ніяк не пов'язані з їхньою власною конфігурацією. В кінці списку —
+    # шкодити вже нікому.
     ("pytorch / llm=2 / tts=3 / par=1",
      {"llm": {"n_threads": 2}, "tts": {"engine": "pytorch", "n_threads": 3, "parallel_chunks": 1}}),
-
-    ("onnx / llm=2 / tts=3 / par=2",
-     {"llm": {"n_threads": 2}, "tts": {"engine": "onnx", "n_threads": 3, "parallel_chunks": 2}}),
 ]
 
 
@@ -96,6 +113,7 @@ def run_once(llm_module: LLMHandler, tts_module: TTSHandler, phrase: str, seed: 
 
     is_first = True
     start_llm = time.time()
+    tts_module.start_turn_timer(start_llm)
     last_yield = start_llm
     first_token_time = None
     segment_gaps = []
@@ -144,7 +162,7 @@ def summarize(reps_data: list) -> dict:
             lambda r: statistics.mean(r["llm_segment_gaps"]) if r["llm_segment_gaps"] else None
         ),
         "tts_chunk_mean": mean_of(
-            lambda r: statistics.mean([c["elapsed"] for c in r["tts_chunk_metrics"]])
+            lambda r: statistics.mean([c["synth_time"] for c in r["tts_chunk_metrics"]])
             if r["tts_chunk_metrics"] else None
         ),
         "silence_total_mean": mean_of(lambda r: sum(r["silence_log"])),
@@ -229,12 +247,19 @@ def main():
                     "rep": rep,
                     "llm_first_token": round(result["llm_first_token"], 3),
                     "llm_segment_gaps": ";".join(f"{g:.3f}" for g in result["llm_segment_gaps"]),
-                    "tts_chunk_times": ";".join(f"{c['elapsed']:.3f}" for c in result["tts_chunk_metrics"]),
+                    "tts_chunk_times": ";".join(f"{c['synth_time']:.3f}" for c in result["tts_chunk_metrics"]),
                     "silence_gaps": ";".join(f"{s:.3f}" for s in result["silence_log"]),
                     "total_time": round(result["total_time"], 3),
                 })
         finally:
             tts_module.shutdown()
+            # Явно звільняємо посилання на важкі моделі й форсуємо GC —
+            # Python неохоче повертає пам'ять ОС сам по собі, а наступний
+            # варіант має стартувати на максимально "чистій" пам'яті,
+            # інакше залишки від важчого варіанта можуть зачепити своп і
+            # спотворити заміри того, що йде ПІСЛЯ нього
+            del llm_module, tts_module
+            gc.collect()
 
         summary_rows.append((label, summarize(reps_data)))
 
