@@ -24,6 +24,21 @@ _LLAMA_LOG_CALLBACK = llama_cpp.llama_log_callback(_silent_llama_log)
 llama_cpp.llama_log_set(_LLAMA_LOG_CALLBACK, ctypes.c_void_p())
 
 
+def _looks_ukrainian(text: str) -> bool:
+    """Груба перевірка, чи шматок тексту переважно кириличний.
+
+    Захист від рідкісних зривів LLM у неукраїнський "потік свідомості"
+    (напр. англомовна self-correction репліка на кшталт "(Self-correction
+    applied... I will simplify this structure.)" замість справжньої
+    відповіді) — таке TTS чесно озвучить слово в слово користувачу,
+    якщо не відсікти заздалегідь."""
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return True  # лише пунктуація/цифри — нема на чому перевіряти
+    cyrillic = sum(1 for c in letters if '\u0400' <= c <= '\u04FF')
+    return (cyrillic / len(letters)) >= 0.5
+
+
 class LLMHandler:
     def __init__(self, config):
         self.llm_config = config.get('llm', {})
@@ -38,6 +53,29 @@ class LLMHandler:
             log.critical(f"❌ [LLM] Файл моделі не знайдено: {model_path}")
             self.model = None
             return
+
+        # LoRA-адаптер — опційний. Той самий механізм, що й --lora у
+        # llama-cli.exe: окремий GGUF-файл з "дельтою" ваг поверх базової
+        # моделі, без потреби заздалегідь мержити їх в один файл.
+        # use_lora — перемикач "з LoRA / без", той самий патерн, що й
+        # tts.use_verbalizer: шлях лишається прописаним у конфізі завжди,
+        # а вмикається/вимикається однією зміною true/false, без потреби
+        # стирати чи повертати lora_path щоразу, коли хочеш порівняти
+        # характер моделі з адаптером і без нього.
+        lora_path = self.llm_config.get('lora_path', '')
+        use_lora = self.llm_config.get('use_lora', True)
+        lora_kwargs = {}
+        if lora_path and use_lora:
+            if os.path.exists(lora_path):
+                lora_kwargs['lora_path'] = lora_path
+                lora_kwargs['lora_scale'] = self.llm_config.get('lora_scale', 1.0)
+                log.info(f"🧬 [LLM] LoRA-адаптер: {os.path.basename(lora_path)} "
+                         f"(scale={lora_kwargs['lora_scale']})")
+            else:
+                log.warning(f"⚠️ [LLM] LoRA-адаптер не знайдено за шляхом '{lora_path}' — "
+                            f"завантажую модель БЕЗ нього.")
+        elif lora_path and not use_lora:
+            log.info("🧬 [LLM] LoRA-адаптер вимкнено (llm.use_lora=false), хоча шлях і вказано.")
 
         log.info(f"🧠 [LLM] Завантаження моделі {self.character_name}...")
 
@@ -58,7 +96,8 @@ class LLMHandler:
                     n_batch=self.llm_config.get('n_batch', 256),
                     flash_attn=True,
                     swa_full=False,
-                    verbose=False
+                    verbose=False,
+                    **lora_kwargs
                 )
         finally:
             os.dup2(old_stdout, 1)
@@ -123,6 +162,7 @@ class LLMHandler:
         buf = ""
         is_first = True
         full_response = ""
+        aborted = False
 
         for chunk in response_stream:
             buf += chunk["choices"][0]["text"]
@@ -135,9 +175,18 @@ class LLMHandler:
                         buf = buf[m.end():]
                         is_first = False
                         found = True
+                        if not _looks_ukrainian(candidate):
+                            log.warning(
+                                f"⚠️ [LLM] Модель зірвалась у неукраїнський текст, "
+                                f"обриваю генерацію: {candidate[:80]}..."
+                            )
+                            aborted = True
+                            break
                         full_response += " " + candidate
                         yield candidate
                         break
+                if aborted:
+                    break
                 if found:
                     continue
                 continue
@@ -150,6 +199,13 @@ class LLMHandler:
                     part = buf[:end].strip()
                     buf = buf[end:]
                     if part:
+                        if not _looks_ukrainian(part):
+                            log.warning(
+                                f"⚠️ [LLM] Модель зірвалась у неукраїнський текст, "
+                                f"обриваю генерацію: {part[:80]}..."
+                            )
+                            aborted = True
+                            break
                         full_response += " " + part
                         yield part
                 elif len(buf) >= NEXT_MAX:
@@ -158,12 +214,23 @@ class LLMHandler:
                     part = buf[:sp].strip()
                     buf = buf[sp:]
                     if part:
+                        if not _looks_ukrainian(part):
+                            log.warning(
+                                f"⚠️ [LLM] Модель зірвалась у неукраїнський текст, "
+                                f"обриваю генерацію: {part[:80]}..."
+                            )
+                            aborted = True
+                            break
                         full_response += " " + part
                         yield part
 
-        if buf.strip():
-            full_response += " " + buf.strip()
-            yield buf.strip()
+        if not aborted and buf.strip():
+            tail = buf.strip()
+            if _looks_ukrainian(tail):
+                full_response += " " + tail
+                yield tail
+            else:
+                log.warning(f"⚠️ [LLM] Модель зірвалась у неукраїнський текст (хвіст), не озвучую: {tail[:80]}...")
 
         if full_response.strip():
             self.history.append({"role": "assistant", "text": full_response.strip()})
